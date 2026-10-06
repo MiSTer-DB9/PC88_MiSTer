@@ -148,6 +148,7 @@ set_global_assignment -name VHDL_FILE rtl/RTC/rtc4990MiSTer.vhd
 set_global_assignment -name VHDL_FILE rtl/RTC/rtcbody.vhd
 set_global_assignment -name VHDL_FILE rtl/Cyc5/romcopy.vhd
 set_global_assignment -name VHDL_FILE rtl/sdramcde0cvDEMU2.vhd
+set_global_assignment -name VHDL_FILE rtl/sdrbridge.vhd
 set_global_assignment -name QIP_FILE rtl/TEXTRAM.qip
 set_global_assignment -name VHDL_FILE rtl/IO_RD.vhd
 set_global_assignment -name VHDL_FILE rtl/IO_WR.vhd
@@ -167,4 +168,10 @@ set_global_assignment -name VHDL_FILE rtl/mainport.vhd
 set_global_assignment -name VERILOG_FILE rtl/ps2mouse.v
 set_global_assignment -name VHDL_FILE rtl/PC88MiSTer.vhd
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/cmt_demod.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/cmt_serial.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/cmt_arb.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/cmt_file.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/cmt_t88.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/cmt_fmt.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/cmt_play.sv
 set_global_assignment -name SYSTEMVERILOG_FILE PC8801SR.sv
