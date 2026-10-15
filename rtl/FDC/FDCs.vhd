@@ -2794,6 +2794,7 @@ begin
 							if(bytecount>0)then
 								bytecount<=bytecount-1;
 							else
+								lastsect:='0';
 								if(R/=EOT)then
 									incR<='1';
 								elsif(MT='1')then
@@ -2806,10 +2807,12 @@ begin
 										resH<='1';
 										resHD<='1';
 										incC<='1';
+										lastsect:='1';
 									end if;
 								else
 									resR<='1';
 									incC<='1';
+									lastsect:='1';
 								end if;
 								if(sOR='1')then
 									sHD<=HD;
@@ -2834,6 +2837,19 @@ begin
 									PCN<=cPCN;
 									INT<='1';
 									-- iSE<='1';
+									end_EXEC<='1';
+								elsif(lastsect='1')then
+									-- reached EOT without TC: end the command here with EN set, like the reads
+									execstate<=es_IDLE;
+									sIC<="00";
+									sEN<='1';
+									sHD<=HD;
+									sUS<=US;
+									sNR<=readyv(iUS);
+									sEC<='0';
+									sSE<='0';
+									PCN<=cPCN;
+									INT<='1';
 									end_EXEC<='1';
 								else
 									nturns<=0;
@@ -4750,10 +4766,10 @@ begin
 		rstn	=>rstn
 	);
 
-	seek_cyl0<=iC0 when tdo(0)='1' else iC0*2 when (iC0*2)<maxtrack else maxtrack;
-	seek_cyl1<=iC1 when tdo(1)='1' else iC1*2 when (iC1*2)<maxtrack else maxtrack;
-	seek_cyl2<=iC2 when tdo(2)='1' else iC2*2 when (iC2*2)<maxtrack else maxtrack;
-	seek_cyl3<=iC3 when tdo(3)='1' else iC3*2 when (iC3*2)<maxtrack else maxtrack;
+	seek_cyl0<=iC0;
+	seek_cyl1<=iC1;
+	seek_cyl2<=iC2;
+	seek_cyl3<=iC3;
 	
 	seek_sft0	<=seek_sft when seekusel="00" else '0';
 	seek_sft1	<=seek_sft when seekusel="01" else '0';
@@ -4865,10 +4881,10 @@ begin
 	PCN2<=conv_std_logic_vector(seek_cur2,8);
 	PCN3<=conv_std_logic_vector(seek_cur3,8);
 	
-	mPCN0<=PCN0 when tdo(0)='1' else '0' & PCN0(7 downto 1);
-	mPCN1<=PCN1 when tdo(1)='1' else '0' & PCN1(7 downto 1);
-	mPCN2<=PCN2 when tdo(2)='1' else '0' & PCN2(7 downto 1);
-	mPCN3<=PCN3 when tdo(3)='1' else '0' & PCN3(7 downto 1);
+	mPCN0<=PCN0;
+	mPCN1<=PCN1;
+	mPCN2<=PCN2;
+	mPCN3<=PCN3;
 	
 	cPCN<=	mPCN0 when US="00" else
 				mPCN1 when US="01" else
