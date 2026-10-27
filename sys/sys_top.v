@@ -1571,6 +1571,11 @@ assign SDCD_SPDIF = (mcp_en & ~spdif) ? 1'b0 : 1'bZ;
 `ifndef MISTER_DUAL_SDRAM
 	wire analog_l, analog_r;
 
+	// [MiSTer-DB9 BEGIN] - AUDIO_MODE INI override of SW[0]
+	wire [1:0] audio_mode_force = cfg[15:14];
+	wire       audio_route_i2s  = (audio_mode_force == 2'b00) ? (SW[0] | mcp_en) : audio_mode_force[0];
+	// [MiSTer-DB9 END]
+
 `endif
 
 assign HDMI_MCLK = clk_audio;
@@ -1623,16 +1628,13 @@ audio_out audio_out
 );
 
 `ifndef MISTER_DUAL_SDRAM
-	// [MiSTer-DB9 BEGIN] - AUDIO_MODE INI override of SW[0]
-	wire [1:0] audio_mode_force = cfg[15:14];
-	wire       audio_route_i2s  = (audio_mode_force == 2'b00) ? (SW[0] | mcp_en) : audio_mode_force[0];
-	// [MiSTer-DB9 END]
-
 	reg aud_spdif_q, aud_r_q, aud_l_q;
 	always @(posedge clk_audio) begin
+		// [MiSTer-DB9 BEGIN] - AUDIO_MODE INI override of SW[0]
 		aud_spdif_q <= audio_route_i2s ? HDMI_LRCLK : spdif;
 		aud_r_q     <= audio_route_i2s ? HDMI_I2S   : analog_r;
 		aud_l_q     <= audio_route_i2s ? HDMI_SCLK  : analog_l;
+		// [MiSTer-DB9 END]
 	end
 
 	assign AUDIO_SPDIF = av_dis ? 1'bZ : aud_spdif_q;
