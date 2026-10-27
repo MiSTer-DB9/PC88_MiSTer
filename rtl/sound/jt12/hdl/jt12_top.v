@@ -48,6 +48,7 @@ module jt12_top (
     output          adpcmb_roe_n, // ADPCM-B ROM output enable
     output          adpcmb_wr_n,  // ADPCM-B RAM write strobe
     output  [ 7:0]  adpcmb_dout,
+    input           adpcmb_wait,  // ADPCM-B RAM access not finished yet
     // I/O pins used by YM2203 embedded YM2149 chip
     input      [7:0] IOA_in,
     input      [7:0] IOB_in,
@@ -84,10 +85,31 @@ parameter JT49_COMP=3'd1,
           YM2203_LUMPED=0;
 parameter mask_div=1;
 parameter use_chipid=0;
+parameter busy_len=32;
+parameter read_bus=0;
 
 wire flag_A, flag_B, busy;
 
 wire write = !cs_n && !wr_n;
+
+// For read_bus: the last byte written to any port, the register last selected at
+// the first address port (the SSG keeps it when the second one is written), and
+// whether the last address written was FFh at the first port (chip ID)
+reg [7:0] last_din, ssg_sel;
+reg       id_sel;
+always @(posedge clk)
+    if( rst ) begin
+        last_din <= 8'd0;
+        ssg_sel  <= 8'd0;
+        id_sel   <= 1'b0;
+    end else if( write ) begin
+        last_din <= din;
+        if( !addr[0] ) begin
+            if( !addr[1] ) ssg_sel <= din;
+            id_sel <= !addr[1] && din==8'hff;
+        end
+    end
+
 wire clk_en, clk_en_ssg;
 
 // Timers
@@ -167,6 +189,7 @@ wire        acmd_on_b;     // Control - Process start, Key On
 wire        acmd_rep_b;    // Control - Repeat
 wire        acmd_rst_b;    // Control - Reset
 wire        acmd_up_b;     // Control - New cmd received
+wire        acmd_ad_b;     // Control - Address set
 wire        acmd_rec_b;    // Control - YM2608 Recording
 wire        acmd_mem_b;    // Control - YM2608 Select external memory
 wire        acmd_x8_b;     // Control - YM2608 RAM 8bit granularity
@@ -342,6 +365,7 @@ if( use_adpcm==2 ) begin: gen_adpcm
         .acmd_rep_b ( acmd_rep_b    ),  // Control - Repeat
         .acmd_rst_b ( acmd_rst_b    ),  // Control - Reset
         .acmd_up_b  ( acmd_up_b     ),  // Control - New command received
+        .acmd_ad_b  ( acmd_ad_b     ),  // Control - Address set
         .alr_b      ( alr_b         ),  // Left / Right
         .astart_b   ( astart_b      ),  // Start address
         .aend_b     ( aend_b        ),  // End   address
@@ -350,6 +374,7 @@ if( use_adpcm==2 ) begin: gen_adpcm
         .alimit_b   ( alimit_b      ),  // Limit address
         // Flag
         .flag       ( adpcmb_flag2  ),
+        .mask       ( flag_mask[4:2] ),
         .clr_flag   ( flag_ctl[5:2] ),
         // memory
         .addr       ( adpcmb_addr   ),
@@ -357,6 +382,7 @@ if( use_adpcm==2 ) begin: gen_adpcm
         .ram_dout   ( adpcmb_dout   ),
         .ram_oe_n   ( adpcmb_roe_n  ),
         .ram_wr_n   ( adpcmb_wr_n   ),
+        .ram_wait   ( adpcmb_wait   ),
         .bus_din    ( din           ),
         .bus_dout   ( dout_b        ),
         .sel_ram    ( sel_ram       ),
@@ -376,7 +402,6 @@ if( use_adpcm==2 ) begin: gen_adpcm
     jt08_acc u_acc(
         .clk        ( clk           ),
         .clk_en     ( clk_en        ),
-        .cen        ( cen           ),
         .op_result  ( op_result_hd  ),
         .rl         ( rl            ),
         .zero       ( zero          ),
@@ -415,7 +440,7 @@ if( use_adpcm==0 ) begin: gen_adpcm_no
 end
 endgenerate
 
-jt12_dout #(.use_ssg(use_ssg),.use_adpcm(use_adpcm),.use_chipid(use_chipid)) u_dout(
+jt12_dout #(.use_ssg(use_ssg),.use_adpcm(use_adpcm),.use_chipid(use_chipid),.read_bus(read_bus)) u_dout(
 //    .rst_n          ( rst_n         ),
     .clk            ( clk           ),        // CPU clock
     .flag_A         ( flag_A        ),
@@ -424,14 +449,17 @@ jt12_dout #(.use_ssg(use_ssg),.use_adpcm(use_adpcm),.use_chipid(use_chipid)) u_d
     .sel_chipid     ( sel_chipid    ),
     .adpcma_flags   ( adpcma_flags & flag_mask[5:0] ),
     .adpcmb_flag    ( adpcmb_flag & flag_mask[6]    ),
-    .adpcmb_flag2   ( adpcmb_flag2 & { 2'b1, flag_mask[4:2] } ),
+    .adpcmb_flag2   ( adpcmb_flag2  ),
     .psg_dout       ( psg_dout      ),
+    .ssg_sel        ( ssg_sel       ),
+    .id_sel         ( id_sel        ),
+    .last_din       ( last_din      ),
     .dout_b         ( dout_b        ),
     .addr           ( addr          ),
     .dout           ( dout          )
 );
 
-jt12_mmr #(.use_ssg(use_ssg),.num_ch(num_ch),.use_pcm(use_pcm), .use_adpcm(use_adpcm), .mask_div(mask_div), .use_chipid(use_chipid))
+jt12_mmr #(.use_ssg(use_ssg),.num_ch(num_ch),.use_pcm(use_pcm), .use_adpcm(use_adpcm), .mask_div(mask_div), .use_chipid(use_chipid), .busy_len(busy_len))
     u_mmr(
     .rst        ( rst       ),
     .clk        ( clk       ),
@@ -484,6 +512,7 @@ jt12_mmr #(.use_ssg(use_ssg),.num_ch(num_ch),.use_pcm(use_pcm), .use_adpcm(use_a
     .acmd_rep_b ( acmd_rep_b    ),  // Control - Repeat
     .acmd_rst_b ( acmd_rst_b    ),  // Control - Reset
     .acmd_up_b  ( acmd_up_b     ),  // Control - New command received
+    .acmd_ad_b  ( acmd_ad_b     ),
     .acmd_rec_b ( acmd_rec_b    ),
     .acmd_mem_b ( acmd_mem_b    ),
     .acmd_x8_b  ( acmd_x8_b     ),
@@ -564,8 +593,8 @@ generate
             .value_B    ( value_B       ),
             .load_A     ( load_A        ),
             .load_B     ( load_B        ),
-            .enable_irq_A( enable_irq_A ),
-            .enable_irq_B( enable_irq_B ),
+            .enable_irq_A( opna_enable_A ),
+            .enable_irq_B( opna_enable_B ),
             .clr_flag_A ( clr_flag_A    ),
             .clr_flag_B ( clr_flag_B    ),
             .flag_A     ( flag_A        ),
@@ -573,7 +602,9 @@ generate
             .overflow_A ( overflow_A    ),
             .irq_n      (               )
         );
-        assign irq_n = ~( (flag_A&enable_irq_A&flag_mask[0]&irq_mask[0]) | (flag_B&enable_irq_B&flag_mask[1]&irq_mask[1]) | (|(adpcmb_flag2[2:0]&flag_mask[4:2]&irq_mask[4:2])) );
+        wire opna_enable_A = enable_irq_A & flag_mask[0];
+        wire opna_enable_B = enable_irq_B & flag_mask[1];
+        assign irq_n = ~( (flag_A&irq_mask[0]) | (flag_B&irq_mask[1]) | (|(adpcmb_flag2[2:0]&irq_mask[4:2])) );
 
     end else begin
         jt12_timers #(.num_ch(num_ch)) u_timers (
@@ -629,7 +660,7 @@ generate
             .rst_n      ( ~rst      ),
             .clk        ( clk       ),    // signal on positive edge
             .clk_en     ( clk_en_ssg),    // clock enable on negative edge
-            .addr       ( psg_addr  ),
+            .addr       ( read_bus ? ssg_sel[3:0] : psg_addr ),
             .cs_n       ( 1'b0      ),
             .wr_n       ( psg_wr_n  ),  // write
             .din        ( psg_data  ),

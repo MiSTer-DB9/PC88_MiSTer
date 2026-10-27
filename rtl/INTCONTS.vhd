@@ -31,8 +31,11 @@ port(
 	INT7n	:in std_logic;
 	
 	cpuclk	:in std_logic;
+	ce_r	:in std_logic;		-- the cycles where the old CPU clock rose / fell
+	ce_f	:in std_logic;
 	clk		:in std_logic;
-	rstn	:in std_logic
+	rstn	:in std_logic;
+	rstnc	:in std_logic		-- reset for the cpuclk side, released on cpuclk
 );
 end INTCONTS;
 
@@ -57,22 +60,33 @@ signal	M1nc	:std_logic;
 -- signal	VECOEc	:std_logic;
 signal	INTRQ	:std_logic_vector(7 downto 0);
 signal	INTRQm	:std_logic_vector(7 downto 0);
+signal	MSKCLR	:std_logic_vector(7 downto 0);	-- requests dropped by a write to MSKADR
 signal	INTCLR	:std_logic;
 signal	INTCLRN	:integer range 0 to 7;
 signal	INTdisCLR	:std_logic;		-- INT DIS FF clear req
+signal	LEVwr	:std_logic;		-- a widening write to CNTADR waits for the strobe to end
+signal	LEVdat	:std_logic_vector(3 downto 0);
+signal	LEVin	:std_logic;		-- inside a write to CNTADR
+signal	LEVimm	:std_logic;		-- that write narrows the level: apply it at once
+
+function levmask(lev :std_logic_vector(3 downto 0)) return std_logic_vector is
+begin
+	case lev is
+	when x"7" => return "01111111";
+	when x"6" => return "00111111";
+	when x"5" => return "00011111";
+	when x"4" => return "00001111";
+	when x"3" => return "00000111";
+	when x"2" => return "00000011";
+	when x"1" => return "00000001";
+	when x"0" => return "00000000";
+	when others => return "11111111";
+	end case;
+end levmask;
 
 begin
 
-	INTlmsk<=	
-				"01111111" when INTlev=x"7" else
-				"00111111" when INTlev=x"6" else
-				"00011111" when INTlev=x"5" else
-				"00001111" when INTlev=x"4" else
-				"00000111" when INTlev=x"3" else
-				"00000011" when INTlev=x"2" else
-				"00000001" when INTlev=x"1" else
-				"00000000" when INTlev=x"0" else
-				"11111111";
+	INTlmsk<=levmask(INTlev);
 
 	process(clk,rstn)begin
 		if(rstn='0')then
@@ -91,7 +105,9 @@ begin
 			INTRQ<=(others=>'0');
 		elsif(clk' event and clk='1')then
 			for i in 0 to 7 loop
-				if(INTbn(i)='0' and lINTbn(i)='1')then
+				if(MSKCLR(i)='1')then
+					INTRQ(i)<='0';
+				elsif(INTbn(i)='0' and lINTbn(i)='1')then
 					INTRQ(i)<='1';
 				elsif(INTCLRN=i and INTCLR='1')then
 					INTRQ(i)<='0';
@@ -105,25 +121,65 @@ begin
 
 	IOWRn<=IORQn or WRn;
 	
-	process(cpuclk,rstn)begin
-		if(rstn='0')then
+	process(cpuclk,rstnc)
+	variable imm	:std_logic;
+	begin
+		if(rstnc='0')then
 			INTmsk<=(others=>'1');
 			INTlev<=(others=>'0');
 			INTdisCLR<='0';
+			LEVwr<='0';
+			LEVdat<=(others=>'0');
+			LEVin<='0';
+			LEVimm<='0';
+			MSKCLR<=(others=>'0');
 		elsif(cpuclk' event and cpuclk='1')then
+		 MSKCLR<=(others=>'0');
+		 if(ce_r='1')then
 			INTdisCLR<='0';
+			-- A write that narrows the level takes effect during the write. Any
+			-- other write takes effect when the write ends, as on a real
+			-- PC-8801: an interrupt it lets through is taken one instruction
+			-- after the OUT, not at its end.
+			if(IOWRn='1')then
+				LEVin<='0';
+				if(LEVwr='1')then
+					INTlev<=LEVdat;
+					INTdisCLR<='1';
+					LEVwr<='0';
+				end if;
+			end if;
 			if(IOWRn='0')then
 				case ADR is
 				when CNTADR =>
-					INTlev<=DATIN(3 downto 0);
-					INTdisCLR<='1';
+					LEVin<='1';
+					imm:=LEVimm;
+					if(LEVin='0')then
+						if((levmask(DATIN(3 downto 0)) and not INTlmsk)=x"00" and levmask(DATIN(3 downto 0))/=INTlmsk)then
+							imm:='1';
+						else
+							imm:='0';
+						end if;
+						LEVimm<=imm;
+					end if;
+					if(imm='1')then
+						INTlev<=DATIN(3 downto 0);
+						INTdisCLR<='1';
+					else
+						LEVdat<=DATIN(3 downto 0);
+						LEVwr<='1';
+					end if;
 				when MSKADR =>
 					INTmsk(0)<=DATIN(2);
 					INTmsk(1)<=DATIN(1);
 					INTmsk(2)<=DATIN(0);
+					-- As on a PC-8801FH, a request that is masked before or after the write is dropped,
+					-- so one that came while it was masked is not taken when it is unmasked
+					MSKCLR<=not (("11111" & DATIN(0) & DATIN(1) & DATIN(2)) and INTmsk);
 				when others =>
 				end case;
 			end if;
+		 end if;
 		end if;
 	end process;
 	
@@ -202,13 +258,15 @@ begin
 		end if;
 	end process;
 	
-	process(cpuclk,rstn)begin
-		if(rstn='0')then
+	process(cpuclk,rstnc)begin
+		if(rstnc='0')then
 			M1nc<='1';
 			-- VECOEc<='0';
-		elsif(cpuclk' event and cpuclk='0')then
+		elsif(cpuclk' event and cpuclk='1')then
+		 if(ce_f='1')then
 			M1nc<=M1n;
 			-- VECOEc<=VECOE;
+		 end if;
 		end if;
 	end process;
 	

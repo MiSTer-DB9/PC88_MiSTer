@@ -19,6 +19,7 @@ port(
 	rdfdmode	:in std_logic_vector(7 downto 0);
 	curfdmode	:out std_logic_vector(7 downto 0);
 	modeset		:in std_logic_vector(3 downto 0);
+	dstep		:in std_logic_vector(3 downto 0);	-- 1: 2D image, the drive moves 2 positions per STEP
 	wrote		:out std_logic_vector(3 downto 0);
 	wprot		:in std_logic_vector(3 downto 0);
 	tracklen	:out std_logic_vector(13 downto 0);
@@ -45,6 +46,10 @@ end FDemu;
 
 architecture rtl of FDemu is
 constant 	maxbwidth	:integer	:=4000*sysclk/1000000;
+-- bit cells in 1/256 clocks, rounded (sysclk in kHz): BR_ns*sysclk*256/10^6
+constant	cellf4000	:integer	:=(4000*sysclk*16+31250)/62500;
+constant	cellf2000	:integer	:=(2000*sysclk*16+31250)/62500;
+constant	cellf1000	:integer	:=(1000*sysclk*16+31250)/62500;
 signal	TRAMRDDAT		:std_logic_vector(8 downto 0);
 signal	RDMFM		:std_logic;
 signal	deminit		:std_logic;
@@ -94,14 +99,27 @@ signal	modbreak	:std_logic;
 
 signal	curpos		:std_logic_vector(13 downto 0);
 signal	lcurpos		:std_logic_vector(13 downto 0);
+signal	tpos		:std_logic_vector(13 downto 0);
+signal	tposinc		:std_logic_vector(13 downto 0);
+signal	tposnext	:std_logic_vector(13 downto 0);
+signal	tposbase	:std_logic_vector(13 downto 0);
+signal	tsel		:std_logic_vector(10 downto 0);
+signal	ltsel		:std_logic_vector(10 downto 0);
+signal	rebase		:std_logic;
+signal	tposrb		:std_logic;
 
-signal	bitlenr,bitlenw		:integer range 0 to maxbwidth;
+signal	bitlenw			:integer range 0 to maxbwidth;
+signal	bitlenrf,bitlenrm	:integer range 0 to cellf4000;
 
 signal	curtrack	:std_logic_vector(6 downto 0);
+signal	dstepx		:std_logic;
+signal	pastimg		:std_logic;	-- the head is past the tracks built from the image
+signal	rdatx		:std_logic_vector(15 downto 0);
 signal	curtrack0	:std_logic_vector(6 downto 0);
 signal	curtrack1	:std_logic_vector(6 downto 0);
 signal	curtrack2	:std_logic_vector(6 downto 0);
 signal	curtrack3	:std_logic_vector(6 downto 0);
+signal	ldstep		:std_logic_vector(3 downto 0);
 signal	tracklenx	:std_logic_vector(13 downto 0);
 signal	tracklen0	:std_logic_vector(13 downto 0);
 signal	tracklen1	:std_logic_vector(13 downto 0);
@@ -229,9 +247,9 @@ port(
 );
 end component;
 
-component sftgen
+component sftfrac
 generic(
-	maxlen	:integer	:=100
+	maxlen	:integer	:=100*256
 );
 port(
 	len		:in integer range 0 to maxlen;
@@ -345,7 +363,6 @@ begin
 					fdenbl3	when USEL="11" else
 					'0';
 
-	bitlenr<=	4000*sysclk/1000000	when selfdmode(1)='0' else 2000*sysclk/1000000;
 				
 	bitlenw<=	4000*sysclk/1000000	when WRFDMODE(1)='0' else 2000*sysclk/1000000;
 				
@@ -391,24 +408,60 @@ begin
 		end if;
 	end process;
 	
+	--one turn is counted in time, not in words: an FM word takes the time of 2 MFM words
+	--when another drive, side or track is selected or the image is replaced, restart the time from the word position, as the position was kept in words before;
+	--the first word after it counts as MFM (its density may still be that of the word before), so that the turn never ends early
+	tsel<=USEL & curtrack & siden & txenable;
+	tposrb<='1' when tsel/=ltsel or rebase='1' else '0';
+	tposinc<=	"00000000000001" when tposrb='1' else
+				"00000000000001" when txwr='1' and RDMFM='1' else
+				"00000000000001" when txwr='0' and WRMFM='1' else
+				"00000000000010";
+	tposbase<=curpos when tposrb='1' else tpos;
+	tposnext<=tposbase+tposinc;
+
 	process(clk,rstn)begin
 		if(rstn='0')then
 			curpos<=(others=>'0');
+			tpos<=(others=>'0');
+			ltsel<=(others=>'0');
+			rebase<='0';
 		elsif(clk' event and clk='1')then
+			ltsel<=tsel;
+			if(tsel/=ltsel)then
+				rebase<='1';
+			end if;
 			if(txwr='1' or (WRENn='0' and rxed='1'))then
-				if(curpos>=tracklenx-1)then
+				if(tsel=ltsel)then
+					rebase<='0';
+				end if;
+				if(tposnext>=tracklenx)then
 					curpos<=(others=>'0');
+					tpos<=(others=>'0');
 				else
 					curpos<=curpos+1;
+					tpos<=tposnext;
 				end if;
+			elsif(tsel/=ltsel)then
+				tpos<=curpos;
 			end if;
 		end if;
 	end process;
 				
 	
-	txdat<=ramrdat(7 downto 0);
-	mcrdat<=ramrdat(8);
-	RDMFM<=ramrdat(9);
+	--past the tracks built from the image (2D: cylinder 42 on, others: cylinder 82 on) nothing was written to the RAM:
+	--play an unformatted MFM track there, as for an unformatted track in the image, not what is left in the RAM
+	dstepx<=	dstep(0) when USEL="00" else
+				dstep(1) when USEL="01" else
+				dstep(2) when USEL="10" else
+				dstep(3);
+	pastimg<=	'1' when dstepx='1' and curtrack>="1010100" else
+				'1' when dstepx='0' and curtrack>="1010010" else
+				'0';
+	rdatx<=x"024e" when pastimg='1' else ramrdat;
+	txdat<=rdatx(7 downto 0);
+	mcrdat<=rdatx(8);
+	RDMFM<=rdatx(9);
 	
 	fmtxwr<=	'0' when RDMFM='1' else
 				'0' when mcrdat='1' else
@@ -449,8 +502,12 @@ begin
 			
 	indexn<='0' when curpos="00000000000000" else '1';
 	
-	wsftfm	:sftgen generic map(maxbwidth) port map(bitlenr,modsftfm,clk,rstn);
-	wsftmfm	:sftgen generic map(maxbwidth/2) port map(bitlenr/2,modsftmfm,clk,rstn);
+	-- the read data is clocked by fractional bit cells, so the rotation and the
+	-- data rate follow sysclk exactly
+	bitlenrf<=	cellf4000	when selfdmode(1)='0' else cellf2000;
+	bitlenrm<=	cellf2000	when selfdmode(1)='0' else cellf1000;
+	wsftfm	:sftfrac generic map(cellf4000) port map(bitlenrf,modsftfm,clk,rstn);
+	wsftmfm	:sftfrac generic map(cellf4000) port map(bitlenrm,modsftmfm,clk,rstn);
 	
 	fmtx	:fmmod port map(
 		txdat	=>txdat,
@@ -498,17 +555,21 @@ begin
 	fmrxbit<=not WRBITn when WRMFM='0' and WRENn='0' else '0';
 	mfmrxbit<=not WRBITn when WRMFM='1' and WRENn='0' else '0';
 	
+	-- Start the receivers again at each write as well: the density can change after the
+	-- motor has started, and they take the bit length only here.
 	process(clk,rstn)
 	variable lREADY	:std_logic;
+	variable lWRENn	:std_logic;
 	begin
 		if(rstn='0')then
 			lREADY:='0';
+			lWRENn:='1';
 			fmdeminit<='0';
 			mfmdeminit<='0';
 		elsif(clk' event and clk='1')then
 			fmdeminit<='0';
 			mfmdeminit<='0';
-			if(MOTOR='1' and lREADY='0')then
+			if((MOTOR='1' and lREADY='0') or (WRENn='0' and lWRENn='1'))then
 				if(WRMFM='0')then
 					fmdeminit<='1';
 				else
@@ -516,6 +577,7 @@ begin
 				end if;
 			end if;
 			lREADY:=MOTOR;
+			lWRENn:=WRENn;
 		end if;
 	end process;
 	
@@ -664,51 +726,86 @@ begin
 		end if;
 	end process;
 	
+	-- A 2D image is laid out on every other position (diskemu_mister trackaddr), so on a 2D image
+	-- the drive moves 2 positions per STEP, as a real 2D/2HD drive does for 2D media.
 	process(clk,rstn)
 	variable lSTEPn		:std_logic;
+	variable stp		:std_logic;
+	function nexttrack(cur :std_logic_vector(6 downto 0); two,chg,st,inward :std_logic) return std_logic_vector is
+	variable v	:std_logic_vector(6 downto 0);
+	begin
+		v:=cur;
+		if(chg='1')then	-- image type changed: keep the cylinder the FDC counts
+			if(two='1')then
+				if(v>"0111111")then
+					v:="1111110";
+				else
+					v:=v(5 downto 0) & '0';
+				end if;
+			else
+				v:='0' & v(6 downto 1);
+			end if;
+		end if;
+		if(st='1')then
+			if(inward='1')then
+				if(two='0')then
+					v:=v+1;
+				elsif(v>"1111100")then
+					v:="1111110";
+				else
+					v:=v+2;
+				end if;
+			else
+				if(two='0')then
+					if(v>0)then
+						v:=v-1;
+					end if;
+				elsif(v>1)then
+					v:=v-2;
+				else
+					v:=(others=>'0');
+				end if;
+			end if;
+		end if;
+		return v;
+	end function;
 	begin
 		if(rstn='0')then
-			curtrack0<=(others=>'1');
-			curtrack1<=(others=>'1');
-			curtrack2<=(others=>'1');
-			curtrack3<=(others=>'1');
+			--Start on track 0. From 127 a RECALIBRATE, which gives up after 77 steps, would
+			--not reach track 0, while a real head is never that far out.
+			curtrack0<=(others=>'0');
+			curtrack1<=(others=>'0');
+			curtrack2<=(others=>'0');
+			curtrack3<=(others=>'0');
+			ldstep<=(others=>'0');
 			lSTEPn:='1';
 		elsif(clk' event and clk='1')then
 			if(lSTEPn='1' and STEPn='0')then
-				if(SDIRn='0')then
-					case USEL is
-					when "00" =>
-						curtrack0<=curtrack0+1;
-					when "01" =>
-						curtrack1<=curtrack1+1;
-					when "10" =>
-						curtrack2<=curtrack2+1;
-					when "11" =>
-						curtrack3<=curtrack3+1;
-					when others =>
-					end case;
-				else
-					case USEL is
-					when "00" =>
-						if(curtrack0>0)then
-							curtrack0<=curtrack0-1;
-						end if;
-					when "01" =>
-						if(curtrack1>0)then
-							curtrack1<=curtrack1-1;
-						end if;
-					when "10" =>
-						if(curtrack2>0)then
-							curtrack2<=curtrack2-1;
-						end if;
-					when "11" =>
-						if(curtrack3>0)then
-							curtrack3<=curtrack3-1;
-						end if;
-					when others =>
-					end case;
-				end if;
+				stp:='1';
+			else
+				stp:='0';
 			end if;
+			if(USEL="00")then
+				curtrack0<=nexttrack(curtrack0,dstep(0),dstep(0) xor ldstep(0),stp,not SDIRn);
+			else
+				curtrack0<=nexttrack(curtrack0,dstep(0),dstep(0) xor ldstep(0),'0',not SDIRn);
+			end if;
+			if(USEL="01")then
+				curtrack1<=nexttrack(curtrack1,dstep(1),dstep(1) xor ldstep(1),stp,not SDIRn);
+			else
+				curtrack1<=nexttrack(curtrack1,dstep(1),dstep(1) xor ldstep(1),'0',not SDIRn);
+			end if;
+			if(USEL="10")then
+				curtrack2<=nexttrack(curtrack2,dstep(2),dstep(2) xor ldstep(2),stp,not SDIRn);
+			else
+				curtrack2<=nexttrack(curtrack2,dstep(2),dstep(2) xor ldstep(2),'0',not SDIRn);
+			end if;
+			if(USEL="11")then
+				curtrack3<=nexttrack(curtrack3,dstep(3),dstep(3) xor ldstep(3),stp,not SDIRn);
+			else
+				curtrack3<=nexttrack(curtrack3,dstep(3),dstep(3) xor ldstep(3),'0',not SDIRn);
+			end if;
+			ldstep<=dstep;
 			lSTEPn:=STEPn;
 		end if;
 	end process;

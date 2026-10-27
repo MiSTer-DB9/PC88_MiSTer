@@ -6,9 +6,9 @@ LIBRARY	IEEE,work;
 	
 entity PC88MiSTer is
 generic(
-	SYSCLK		:integer	:=20000;		--kHz
-	VIDCLK		:integer	:=75000;		--kHz
-	RAMCLK		:integer	:=75000;		--kHz
+	SYSCLK		:integer	:=20238;		--kHz
+	VIDCLK		:integer	:=75892;		--kHz
+	RAMCLK		:integer	:=75892;		--kHz
 	USE_OPN		:integer	:=5;
 	RAMAWIDTH	:integer	:=24;
 	RAMCAWIDTH	:integer	:=9	
@@ -27,6 +27,8 @@ port(
 	LOADER_WR	:in std_logic;
 	LOADER_ACK	:out std_logic;
 	LOADER_DONE	:in std_logic;
+	--RAM type from the OSD (clk21m): "00" Fx, "01" Mx, "10" 512KB (RAMFILL, RAMTYPECTL)
+	RAMTYPE		:in std_logic_vector(1 downto 0) := "00";
 	
 	-- SD-RAM ports
 	pMemCke     : out std_logic;                        -- SD-RAM Clock enable
@@ -70,6 +72,15 @@ port(
 	mist_buffdout	:in std_logic_vector(7 downto 0);
 	mist_buffdin	:out std_logic_vector(7 downto 0);
 	mist_buffwr		:in std_logic;
+
+	--Cassette (CMT) input. Port 30h is decoded in here, so its bits are brought out.
+	cmt_mton		:out std_logic;						--30h bit3: motor on
+	cmt_bs			:out std_logic_vector(1 downto 0);	--30h bit5: 0=CMT, bit4: 1=1200 baud
+	--USART clock: "00" is the RS-232C rate, "01" is 600 baud and "10" is 1200 baud.
+	--Ignored unless the CPU has put the 8251 in its x16 mode.
+	cmt_clk_sel		:in std_logic_vector(1 downto 0);
+	--8251 mode set by the CPU: factor(7:6), length(5:4), parity enable(3), even(2), stop(1:0).
+	cmt_mode		:out std_logic_vector(7 downto 0);
 	
 
 	-- FDD ports
@@ -77,7 +88,7 @@ port(
 
     -- DIP switch, Lamp ports
 	pDip        : in std_logic_vector(9 downto 0);
-	pCoreConfig	: in std_logic_vector(1 downto 0);
+	pCoreConfig	: in std_logic_vector(4 downto 0);
 	pLed        : out std_logic;
 	pPsw		: in std_logic_vector(1 downto 0);
 	pMonDbus	:out std_logic_vector(7 downto 0);
@@ -90,6 +101,7 @@ port(
 	pVideoVS		: out std_logic;
 	pVideoEn	: out std_logic;
 	pVideoClk	: out std_logic;
+	pVideo24k	: out std_logic;	-- 1:24kHz or 15kHz timing (taken at reset)
 	pSndL			: out std_logic_vector(15 downto 0);
 	pSndR			: out std_logic_vector(15 downto 0);
 	
@@ -130,6 +142,7 @@ component SDRAMCde0cvDEMU2
 		CPUWDAT			:in std_logic_vector(7 downto 0);
 		CPUWR			:in std_logic;
 		CPURD			:in std_logic;
+		CPURDV2			:in std_logic;
 		CPUWAIT			:out std_logic;
 		CPUCLK			:out std_logic;
 		CPURSTn			:out std_logic;
@@ -142,6 +155,10 @@ component SDRAMCde0cvDEMU2
 		SUBRD			:in std_logic;
 		SUBWAIT			:out std_logic;
 		SUBCLK			:out std_logic;
+		SUBCE_R			:out std_logic;
+		SUBCE_F			:out std_logic;
+		CPUCE_R			:out std_logic;
+		CPUCE_F			:out std_logic;
 
 		ALURD0			:out std_logic_vector(7 downto 0);
 		ALURD1			:out std_logic_vector(7 downto 0);
@@ -162,25 +179,25 @@ component SDRAMCde0cvDEMU2
 		VIDWAIT			:out std_logic;
 		
 		FDEADR			:in std_logic_vector(AWIDTH-1 downto 0)	:=(others=>'0');
-		FDERD				:in std_logic								:='0';
+		FDEREQ			:in std_logic								:='0';
 		FDEWR				:in std_logic								:='0';
 		FDERDAT			:out std_logic_Vector(15 downto 0);
 		FDEWDAT			:in std_logic_vector(15 downto 0)	:=(others=>'0');
-		FDEWAIT			:out std_logic;
+		FDEACK			:out std_logic;
 		
 		FECADR			:in std_logic_vector(AWIDTH-1 downto 0)	:=(others=>'0');
-		FECRD				:in std_logic								:='0';
+		FECREQ			:in std_logic								:='0';
 		FECWR				:in std_logic								:='0';
 		FECRDAT			:out std_logic_vector(15 downto 0);
 		FECWDAT			:in std_logic_vector(15 downto 0)	:=(others=>'0');
-		FECWAIT			:out std_logic;
+		FECACK			:out std_logic;
 		
 		SNDADR			:in std_logic_vector(AWIDTH-1 downto 0);
-		SNDRD			:in std_logic;
+		SNDREQ			:in std_logic;
 		SNDWR			:in std_logic;
 		SNDRDAT			:out std_logic_vector(7 downto 0);
 		SNDWDAT			:in std_logic_vector(7 downto 0);
-		SNDWAIT			:out std_logic;
+		SNDACK			:out std_logic;
 		SNDH_Ln			:in std_logic;
 				
 		monout			:out std_logic_vector(7 downto 0);
@@ -194,7 +211,6 @@ end component;
 
 component memorymaps
 generic(
-	extram	:integer	:=0;
 	addrwidth	:integer	:=25
 );
 port(
@@ -226,17 +242,21 @@ port(
 	
 	G_EXTMODE	:out std_logic;
 	G_RAMSEL	:out integer range 0 to 3;
+	G_PLANESEL	:out std_logic;
 	ALUOE		:out std_logic;
 	ALUME		:out std_logic;
 	ALURE		:out std_logic;
 	GADR_MSEL	:out std_logic;
 	
+	EXTTYPE		:in std_logic_vector(1 downto 0);
+
 	clk			:in std_logic;
-	rstn		:in std_logic
+	rstn		:in std_logic;
+	ce			:in std_logic := '1'
 );
 end component;
 
-component T80a
+component T80a_ce
     generic(
         Mode : integer := 0 -- 0 => Z80, 1 => Fast Z80, 2 => 8080, 3 => GB
     );
@@ -256,7 +276,14 @@ component T80a
         HALT_n      : out std_logic;
         BUSAK_n     : out std_logic;
         A           : out std_logic_vector(15 downto 0);
-        D           : inout std_logic_vector(7 downto 0)
+        D           : inout std_logic_vector(7 downto 0);
+        DOUT        : out std_logic_vector(7 downto 0);
+        CE_R        : in std_logic;
+        CE_F        : in std_logic;
+        M1T5        : out std_logic;
+        M1T6        : out std_logic;
+        MRD         : out std_logic;
+        MCYC        : out std_logic_vector(2 downto 0)
     );
 end component;
 
@@ -280,17 +307,23 @@ port(
 end component;
 
 component TEXTRAM
+	GENERIC
+	(
+		DWIDTH		: integer := 8
+	);
 	PORT
 	(
 		address_a		: IN STD_LOGIC_VECTOR (11 DOWNTO 0);
 		address_b		: IN STD_LOGIC_VECTOR (11 DOWNTO 0);
 		clock		: IN STD_LOGIC  := '1';
-		data_a		: IN STD_LOGIC_VECTOR (7 DOWNTO 0);
-		data_b		: IN STD_LOGIC_VECTOR (7 DOWNTO 0);
+		data_a		: IN STD_LOGIC_VECTOR (DWIDTH-1 DOWNTO 0);
+		data_b		: IN STD_LOGIC_VECTOR (DWIDTH-1 DOWNTO 0);
 		wren_a		: IN STD_LOGIC  := '0';
 		wren_b		: IN STD_LOGIC  := '0';
-		q_a		: OUT STD_LOGIC_VECTOR (7 DOWNTO 0);
-		q_b		: OUT STD_LOGIC_VECTOR (7 DOWNTO 0)
+		q_a		: OUT STD_LOGIC_VECTOR (DWIDTH-1 DOWNTO 0);
+		q_b		: OUT STD_LOGIC_VECTOR (DWIDTH-1 DOWNTO 0);
+		ce_a		: IN STD_LOGIC  := '1';
+		ce_b		: IN STD_LOGIC  := '1'
 	);
 END component;
 
@@ -303,7 +336,7 @@ port(
 	PALEN		:in std_logic	:='1';
 	
 	TRAM_ADR	:out std_logic_vector(11 downto 0);
-	TRAM_DAT	:in std_logic_vector(7 downto 0);
+	TRAM_DAT	:in std_logic_vector(8 downto 0);
 	
 	GRAMADR		:out std_logic_vector(13 downto 0);
 	GRAMRD		:out std_logic;
@@ -342,15 +375,28 @@ port(
 
 	VRTC		:out std_logic;
 	HRTC		:out std_logic;
+	CURVMODE	:out std_logic;
 
 	FRAMWADR	:in std_logic_Vector(12 downto 0);
 	FRAMWDAT	:in std_logic_vector(7 downto 0);
 	FRAMWR	:in std_logic;
+	FRAM8WR	:in std_logic	:='0';
 
 	gclk		:out std_logic;
+	CE3			:out std_logic;
 	cpuclk		:in std_logic;
+	cpuce		:in std_logic := '1';
 	clk			:in std_logic;
-	rstn		:in std_logic
+	rstn		:in std_logic;
+
+	VT24		:in std_logic	:='0';
+	VT15		:in std_logic	:='0';
+	CTYPE		:in std_logic_vector(1 downto 0)	:="11";
+	SETL		:in std_logic_vector(5 downto 0)	:=(others=>'0');
+	SETR		:in std_logic_vector(4 downto 0)	:=(others=>'0');
+	SETV		:in std_logic_vector(2 downto 0)	:=(others=>'0');
+	SETOK		:in std_logic	:='0';
+	TSET		:out std_logic_vector(17 downto 0)
 );
 end component;
 
@@ -389,6 +435,11 @@ port(
 	AT0		:out std_logic;						--Color
 	SC		:out std_logic;						--??
 	ATTR	:out std_logic_vector(4 downto 0);	--Attribute length
+
+	SETL	:out std_logic_vector(5 downto 0);
+	SETR	:out std_logic_vector(4 downto 0);
+	SETV	:out std_logic_vector(2 downto 0);
+	SETOK	:out std_logic;
 	
 	mon0	:out std_logic_vector(7 downto 0);
 	mon1	:out std_logic_vector(7 downto 0);
@@ -397,7 +448,8 @@ port(
 	mon4	:out std_logic_vector(7 downto 0);
 
 	clk		:in std_logic;
-	rstn	:in std_logic
+	rstn	:in std_logic;
+	ce		:in std_logic
 );
 end component;
 
@@ -487,7 +539,8 @@ port(
 	bit0	:out std_logic;
 
 	clk		:in std_logic;
-	rstn	:in std_logic
+	rstn	:in std_logic;
+	ce		:in std_logic := '1'
 );
 end component;
 
@@ -514,6 +567,299 @@ port(
 	bit0	:out std_logic;
 
 	clk		:in std_logic;
+	rstn	:in std_logic;
+	ce		:in std_logic := '1'
+);
+end component;
+
+component M1WAIT
+port(
+	M1n		:in std_logic;
+	MREQn	:in std_logic;
+	OTHERWAIT	:in std_logic;
+	en		:in std_logic;
+
+	WAITn	:out std_logic;
+
+	clk		:in std_logic;
+	ce_f	:in std_logic;
+	rstn	:in std_logic
+);
+end component;
+
+component MEMWAIT
+port(
+	SEL		:in std_logic;
+	SDWAIT	:in std_logic;
+	OTHERWAIT	:in std_logic;
+	en		:in std_logic;
+
+	WAITn	:out std_logic;
+
+	clk		:in std_logic;
+	ce_f	:in std_logic;
+	rstn	:in std_logic
+);
+end component;
+
+component SUBMEM
+generic(
+	AWIDTH	:integer	:=25
+);
+port(
+	ADR		:in std_logic_vector(AWIDTH-1 downto 0);
+	WR		:in std_logic;
+	WDAT	:in std_logic_vector(7 downto 0);
+	RDAT	:out std_logic_vector(7 downto 0);
+
+	LDADR	:in std_logic_vector(12 downto 0);
+	LDDAT	:in std_logic_vector(7 downto 0);
+	LDWR	:in std_logic;
+
+	clk		:in std_logic
+);
+end component;
+
+component WRPOST
+generic(
+	AWIDTH	:integer	:=25
+);
+port(
+	RD		:in std_logic;
+	WR		:in std_logic;
+	POST	:in std_logic;
+	ADR		:in std_logic_vector(AWIDTH-1 downto 0);
+	WDAT	:in std_logic_vector(7 downto 0);
+	WE		:in std_logic_vector(3 downto 0);
+	KIND	:in std_logic	:='0';
+	WAITo	:out std_logic;
+
+	oRD		:out std_logic;
+	oWR		:out std_logic;
+	oADR	:out std_logic_vector(AWIDTH-1 downto 0);
+	oWDAT	:out std_logic_vector(7 downto 0);
+	oWE		:out std_logic_vector(3 downto 0);
+	oKIND	:out std_logic;
+	WAITi	:in std_logic;
+
+	clk		:in std_logic;
+	rstn	:in std_logic
+);
+end component;
+
+component GVSWAIT
+port(
+	SEL		:in std_logic;
+	OTHERWAIT	:in std_logic;
+	FAST	:in std_logic;
+	STR		:in std_logic;
+	en		:in std_logic;
+
+	WAITn	:out std_logic;
+
+	clk		:in std_logic;
+	ce_f	:in std_logic;
+	rstn	:in std_logic;
+
+	VT24	:in std_logic
+);
+end component;
+
+component BUSWAIT
+port(
+	SEL		:in std_logic;
+	IOSEL	:in std_logic;
+	OTHERWAIT	:in std_logic;
+	FAST	:in std_logic;
+	en		:in std_logic;
+
+	WAITn	:out std_logic;
+
+	clk		:in std_logic;
+	ce_f	:in std_logic;
+	rstn	:in std_logic
+);
+end component;
+
+component TRAMWAIT
+port(
+	SEL		:in std_logic;
+	RDn		:in std_logic;
+	M1n		:in std_logic;
+	CPUMD	:in std_logic;
+	HS		:in std_logic;
+	V1S		:in std_logic;
+
+	WAITn	:out std_logic;
+
+	clk		:in std_logic;
+	ce_f	:in std_logic;
+	rstn	:in std_logic
+);
+end component;
+
+component GVSTRETCH
+port(
+	ce_r_in	:in std_logic;
+	ce_f_in	:in std_logic;
+	STR		:in std_logic;
+	FAST	:in std_logic;
+
+	ce_r	:out std_logic;
+	ce_f	:out std_logic;
+
+	clk		:in std_logic;
+	rstn	:in std_logic;
+
+	T24		:in std_logic;
+	IOC		:in std_logic;
+	T5		:in std_logic;
+	T6		:in std_logic;
+	TXA		:in std_logic;
+	MRD		:in std_logic;
+	MCYC	:in std_logic_vector(2 downto 0)
+);
+end component;
+
+component KNJWAIT
+port(
+	SEL		:in std_logic;
+	CPUMD	:in std_logic;
+
+	WAITn	:out std_logic;
+
+	clk		:in std_logic;
+	ce_f	:in std_logic;
+	rstn	:in std_logic
+);
+end component;
+
+component GVWAIT
+port(
+	SEL		:in std_logic;
+	M1W		:in std_logic;
+	FAST	:in std_logic;
+	en		:in std_logic;
+
+	WAITn	:out std_logic;
+
+	clk		:in std_logic;
+	ce_f	:in std_logic;
+	rstn	:in std_logic;
+
+	VRTC	:in std_logic
+);
+end component;
+
+component cdc_sync2
+port(
+	d		:in std_logic;
+	q		:out std_logic;
+
+	clk		:in std_logic
+);
+end component;
+
+component RAMFILL
+port(
+	CMD		:in std_logic;
+	CTYPE	:in std_logic_vector(1 downto 0);
+	RAM_WAIT	:in std_logic;
+
+	ADR		:out std_logic_vector(21 downto 0);
+	WDAT	:out std_logic_vector(7 downto 0);
+	WR		:out std_logic;
+	OE		:out std_logic;
+
+	SADR	:out std_logic_vector(13 downto 0);
+	SWDAT	:out std_logic_vector(7 downto 0);
+	SWR		:out std_logic;
+
+	DONE	:out std_logic;
+	RTYPE	:out std_logic_vector(1 downto 0);
+
+	clk		:in std_logic;
+	rstn	:in std_logic
+);
+end component;
+
+component RAMTYPECTL
+port(
+	OSDTYPE	:in std_logic_vector(1 downto 0);
+	LDONE	:in std_logic;
+	CPURSTN	:in std_logic;
+	FILLDONE	:in std_logic;
+
+	START	:out std_logic;
+	CTYPE	:out std_logic_vector(1 downto 0);
+	BUSY	:in std_logic;
+	ACKD	:in std_logic;
+
+	RELOK	:out std_logic;
+
+	clk		:in std_logic
+);
+end component;
+
+component cdc_hs
+generic(
+	AW		:integer	:=1;
+	BW		:integer	:=1
+);
+port(
+	a_start	:in std_logic;
+	a_data	:in std_logic_vector(AW-1 downto 0);
+	a_busy	:out std_logic;
+	a_done	:out std_logic;
+	a_rdata	:out std_logic_vector(BW-1 downto 0);
+	a_clk	:in std_logic;
+	a_rstn	:in std_logic;
+
+	b_valid	:out std_logic;
+	b_data	:out std_logic_vector(AW-1 downto 0);
+	b_rdata	:in std_logic_vector(BW-1 downto 0);
+	b_clk	:in std_logic;
+	b_rstn	:in std_logic
+);
+end component;
+
+component sdrbridge
+generic(
+	AWIDTH	:integer	:=25;
+	ADRREAD	:boolean	:=false
+);
+port(
+	ADR		:in std_logic_vector(AWIDTH-1 downto 0);
+	RD		:in std_logic;
+	WR		:in std_logic;
+	WDAT	:in std_logic_vector(15 downto 0);
+	RDAT	:out std_logic_vector(15 downto 0);
+	WAITo	:out std_logic;
+
+	REQ		:out std_logic;
+	REQADR	:out std_logic_vector(AWIDTH-1 downto 0);
+	REQWR	:out std_logic;
+	REQWDAT	:out std_logic_vector(15 downto 0);
+	ACK		:in std_logic;
+	ACKRDAT	:in std_logic_vector(15 downto 0);
+
+	clk		:in std_logic;
+	rstn	:in std_logic
+);
+end component;
+
+component FMWAIT
+port(
+	SEL		:in std_logic;
+	IORQn	:in std_logic;
+	RDn		:in std_logic;
+	WRn		:in std_logic;
+	en		:in std_logic;
+
+	WAITn	:out std_logic;
+
+	clk		:in std_logic;
+	ce_f	:in std_logic;
 	rstn	:in std_logic
 );
 end component;
@@ -548,7 +894,12 @@ port(
 	TDMAEN	:out std_logic;
 	
 	clk		:in std_logic;
-	rstn	:in std_logic
+	rstn	:in std_logic;
+	ce		:in std_logic := '1';
+
+	RDn		:in std_logic := '1';
+	RDAT	:out std_logic_vector(7 downto 0);
+	ROE		:out std_logic
 );
 end component;
 
@@ -563,6 +914,14 @@ port(
 	TEXTEN		:in std_logic;
 	ATTRLEN		:in std_logic_vector(4 downto 0);
 	TXTLINES	:in std_logic_vector(5 downto 0);
+
+	V1S			:in std_logic;
+	VMODE		:in std_logic;
+	CPUMD		:in std_logic;
+	GVSTR		:in std_logic;
+	VT24		:in std_logic;
+	VT15		:in std_logic;
+	TSET		:in std_logic_vector(17 downto 0);
 	
 	TADR_TOP	:in std_logic_vector(15 downto 0);
 
@@ -580,14 +939,17 @@ port(
 	
 
 	TVRAM_ADR	:out std_logic_vector(11 downto 0);
-	TVRAM_WDAT	:out std_logic_vector(7 downto 0);
+	TVRAM_WDAT	:out std_logic_vector(8 downto 0);
 	TVRAM_WR	:out std_logic;
 	
 	VRET		:in std_logic;
 	HRET		:in std_logic;
 	DONE		:out std_logic;
 	
+	CPUBUS		:in std_logic;
+	CPUM1n		:in std_logic;
 	clk			:in std_logic;
+	ce			:in std_logic;
 	rstn		:in std_logic
 );
 end component;
@@ -598,11 +960,9 @@ generic(
 	SFTCYC	:integer	:=400
 );
 port(
-	ADR		:in std_logic_vector(7 downto 0);
-	IORQn	:in std_logic;
-	RDn		:in std_logic;
-	DAT		:out std_logic_vector(7 downto 0);
-	OE		:out std_logic;
+	SCANADR	:in std_logic_vector(3 downto 0);
+	SCANDAT	:out std_logic_vector(7 downto 0);
+	INITDONE:out std_logic;
 
 	KBCLKIN	:in std_logic;
 	KBCLKOUT:out std_logic;
@@ -617,6 +977,26 @@ port(
 
 	clk		:in std_logic;
 	rstn	:in std_logic
+);
+end component;
+
+component kbmirror
+port(
+	ADR		:in std_logic_vector(7 downto 0);
+	IORQn	:in std_logic;
+	RDn		:in std_logic;
+	DAT		:out std_logic_vector(7 downto 0);
+	OE		:out std_logic;
+
+	cclk	:in std_logic;
+	crstn	:in std_logic;
+
+	SCANADR	:out std_logic_vector(3 downto 0);
+	SCANDAT	:in std_logic_vector(7 downto 0);
+	INITDONE:in std_logic;
+
+	fclk	:in std_logic;
+	frstn	:in std_logic
 );
 end component;
 
@@ -660,8 +1040,11 @@ port(
 	INT7n	:in std_logic;
 	
 	cpuclk	:in std_logic;
+	ce_r	:in std_logic;
+	ce_f	:in std_logic;
 	clk		:in std_logic;
-	rstn	:in std_logic
+	rstn	:in std_logic;
+	rstnc	:in std_logic
 );
 end component;
 
@@ -710,7 +1093,8 @@ port(
 	PCLoe	:out std_logic;
 	
 	clk		:in std_logic;
-	rstn	:in std_logic
+	rstn	:in std_logic;
+	ce		:in std_logic := '1'
 );
 end component;
 
@@ -729,7 +1113,8 @@ port(
 	KNJRD	:out std_logic;
 	
 	clk		:in std_logic;
-	rstn	:in std_logic
+	rstn	:in std_logic;
+	ce		:in std_logic := '1'
 );
 end component;
 
@@ -755,11 +1140,57 @@ port(
 	TxEMP	:out std_logic;
 	RxRDY	:out std_logic;
 	
+	MODE_BAUD	:out std_logic_vector(1 downto 0);
+	MODE_CLEN	:out std_logic_vector(1 downto 0);
+	MODE_PEN	:out std_logic;
+	MODE_PEV	:out std_logic;
+	MODE_STOP	:out std_logic_vector(1 downto 0);
+	
 	TxCn	:in std_logic;
 	RxCn	:in std_logic;
 	
 	clk		:in std_logic;
 	rstn	:in std_logic
+);
+end component;
+
+component mainport
+port(
+	IORQn	:in std_logic;
+	RDn		:in std_logic;
+	WRn		:in std_logic;
+	M1n		:in std_logic;
+	ADR		:in std_logic_vector(7 downto 0);
+	WDAT	:in std_logic_vector(7 downto 0);
+	RDAT	:out std_logic_vector(7 downto 0);
+	OE		:out std_logic;
+	WAITn	:out std_logic;
+	FMSEL	:in std_logic	:='0';
+	SB2C	:in std_logic	:='0';
+
+	cclk	:in std_logic;
+	crstn	:in std_logic;
+
+	COM_CSn	:out std_logic;
+	COM_RDn	:out std_logic;
+	COM_WRn	:out std_logic;
+	COM_C_Dn:out std_logic;
+	COM_WDAT:out std_logic_vector(7 downto 0);
+	COM_RDAT:in std_logic_vector(7 downto 0);
+
+	FM_WDAT	:out std_logic_vector(7 downto 0);
+	FM_CEN	:in std_logic	:='0';
+	FM1_WRn	:out std_logic;
+	FM1_ADR	:out std_logic;
+	FM1_RDAT:in std_logic_vector(7 downto 0)	:=(others=>'1');
+	FM2_CSn	:out std_logic;
+	FM2_WRn	:out std_logic;
+	FM2_RDn	:out std_logic;
+	FM2_ADR	:out std_logic_vector(1 downto 0);
+	FM2_RDAT:in std_logic_vector(7 downto 0)	:=(others=>'1');
+
+	fclk	:in std_logic;
+	frstn	:in std_logic
 );
 end component;
 
@@ -887,6 +1318,8 @@ port(
 	EMUBUSY			:out std_logic;
 	FDCBUSY			:out std_logic;
 	CPUCLK			:in std_logic;
+	CE_R			:in std_logic;
+	CE_F			:in std_logic;
 	clk21m			:in std_logic;
 	ramclk			:in std_logic;
 	pclk			:in std_logic;
@@ -923,7 +1356,9 @@ port(
 	clk		:in std_logic;
 	cpuclk	:in std_logic;
 	sft		:in std_logic;
-	rstn	:in std_logic
+	rstn	:in std_logic;
+	cpuce	:in std_logic := '1';
+	rstnc	:in std_logic
 );
 end component;
 
@@ -963,7 +1398,9 @@ port(
 	clk		:in std_logic;
 	cpuclk	:in std_logic;
 	sft		:in std_logic;
-	rstn	:in std_logic
+	rstn	:in std_logic;
+	cpuce	:in std_logic := '1';
+	rstnc	:in std_logic
 );
 end component;
 
@@ -1026,6 +1463,7 @@ component JTOPNA
 		adpcm_din 	:in std_logic_vector(7 downto 0);
 		adpcm_wr	:out std_logic;
 		adpcm_dout	:out std_logic_vector(7 downto 0);
+		adpcm_wait	:in std_logic;
 
 		fm_snd_right	:out std_logic_vector(15 downto 0);
 		fm_snd_left		:out std_logic_vector(15 downto 0);
@@ -1056,6 +1494,18 @@ component DIGIFILTER
 		clk	:in std_logic;
 		rstn :in std_logic
 	);
+end component;
+
+component singspk
+port(
+	sing	:in std_logic;
+	beepen	:in std_logic;
+	beep	:in std_logic;
+	sndout	:out std_logic_vector(15 downto 0);
+
+	clk		:in std_logic;
+	rstn	:in std_logic
+);
 end component;
 
 component  beeposc
@@ -1113,7 +1563,8 @@ component UNCHCHATA
 		DST		:out std_logic;
 		
 		clk		:in std_logic;
-		rstn	:in std_logic
+		rstn	:in std_logic;
+		ce		:in std_logic := '1'
 	);
 end component;
 
@@ -1140,6 +1591,24 @@ signal	c40C		:std_logic;
 signal	cDisk		:std_logic;
 signal	cInDev		:std_logic;
 signal	cSB2		:std_logic;
+signal	cSBN		:std_logic;	-- Normal(SR): no YM2608
+signal	VTm,VTm2	:std_logic_vector(1 downto 0)	:="00";	-- the video timing from cfg_r
+signal	cfg_a		:std_logic_vector(10 downto 0);	-- OSD settings on clk21m
+signal	cfg_r		:std_logic_vector(10 downto 0);	-- the same settings on rclk, all from one transfer
+signal	cSB2r,cSBNr	:std_logic;	-- cSB2 and cSBN from cfg_r
+signal	cfg_busy	:std_logic;	-- a transfer of the settings is under way
+signal	cfg_done	:std_logic;	-- that transfer has been taken on rclk
+signal	cfg_vt		:std_logic_vector(1 downto 0);	-- the video timing it carries
+signal	VT24		:std_logic	:='0';	-- 24kHz or 15kHz timing, taken at reset
+signal	VT15		:std_logic	:='0';	-- 15kHz timing, taken at reset
+signal	T24			:std_logic;	-- 24kHz timing
+signal	CRTC_C		:std_logic_vector(1 downto 0);
+signal	CRTC_SETL	:std_logic_vector(5 downto 0);
+signal	CRTC_SETR	:std_logic_vector(4 downto 0);
+signal	CRTC_SETV	:std_logic_vector(2 downto 0);
+signal	CRTC_SETOK	:std_logic;
+signal	CRTC_TSET	:std_logic_vector(17 downto 0);
+signal	TCROSS_ce	:std_logic;
 
 signal	SDI			:std_logic;
 signal	CPUADR		:std_logic_vector(15 downto 0);
@@ -1149,6 +1618,8 @@ signal	RAM_RD		:std_logic;
 signal	RAM_WDAT	:std_logic_vector(7 downto 0);
 signal	IDAT_RAM	:std_logic_vector(7 downto 0);
 signal	CPUDAT		:std_logic_vector(7 downto 0);
+--CPU write data, separated from the bidirectional CPUDAT path for timing.
+signal	CPUDAT_W	:std_logic_vector(7 downto 0);
 signal	RD_n		:std_logic;
 signal	WR_n		:std_logic;
 signal	MREQ_n		:std_logic;
@@ -1160,15 +1631,38 @@ signal	M1_n		:std_logic;
 signal	CPU_rstn	:std_logic;
 signal	CPU_clk		:std_logic;
 signal	BUSRQ_n		:std_logic;
+signal	BUSRQ_nf	:std_logic;
 signal	BUSACK_n	:std_logic;
 signal	RAM_WAIT	:std_logic;
+--The SDRAM port side of WRPOST.
+signal	RAMADRo		:std_logic_vector(RAMAWIDTH-1 downto 0);
+signal	RAM_WRo		:std_logic;
+signal	RAM_RDo		:std_logic;
+signal	RAM_WDATo	:std_logic_vector(7 downto 0);
+signal	RAM_WAITi	:std_logic;
+signal	VRAMWEo		:std_logic_vector(3 downto 0);
+signal	RAM_POST	:std_logic;
+signal	PWSEL		:std_logic;
 -- signal	LOADER_rstn :std_logic;
-signal	CLR_ADR		:std_logic_vector(18 downto 0);
+signal	CLR_ADR		:std_logic_vector(21 downto 0);
 signal	CLR_WDAT	:std_logic_vector(7 downto 0);
 signal	CLR_WR		:std_logic;
 signal	CLR_OE		:std_logic;
+signal	FILLDONE,FILLDONE21	:std_logic;
+signal	FILL_CMD	:std_logic;
+signal	FILL_CTYPE	:std_logic_vector(1 downto 0);
+signal	FILL_RTYPE	:std_logic_vector(1 downto 0);
+signal	FILL_SADR	:std_logic_vector(13 downto 0);
+signal	FILL_SWDAT	:std_logic_vector(7 downto 0);
+signal	FILL_SWR	:std_logic;
+signal	RTC_START,RTC_BUSY,RTC_ACKD,RTC_RELOK	:std_logic;
+signal	RTC_CTYPE	:std_logic_vector(1 downto 0);
+signal	SUBM_ADR	:std_logic_vector(RAMAWIDTH-1 downto 0);
+signal	SUBM_WDAT	:std_logic_vector(7 downto 0);
+signal	SUBM_WR		:std_logic;
 -- signal	CLR_rstn	:std_logic;
 signal	gclk		:std_logic;
+signal	vid_ce3		:std_logic;
 signal	clkcount	:integer range 0 to 5000000;
 signal	slowclk		:std_logic;
 signal	MAP_RADR	:std_logic_vector(RAMAWIDTH-1 downto 0);
@@ -1182,12 +1676,16 @@ signal	IDAT_TRAM	:std_logic_vector(7 downto 0);
 signal	TVRAM_ADR	:std_logic_vector(11 downto 0);
 signal	TVRAM_CE	:std_logic;
 signal	IDAT_TVRAM	:std_logic_vector(7 downto 0);
+signal	TVRAM_QA	:std_logic_vector(8 downto 0);
 signal	CRTC_TADR	:std_logic_vector(11 downto 0);
-signal	CRTC_TDAT	:std_logic_vector(7 downto 0);
+signal	CRTC_TDAT	:std_logic_vector(8 downto 0);
 signal	IDAT_CRTR	:std_logic_vector(7 downto 0);
 signal	CRTR_OE		:std_logic;
 signal	IDAT_KB		:std_logic_vector(7 downto 0);
 signal	KB_OE		:std_logic;
+signal	KB_SCANADR	:std_logic_vector(3 downto 0);
+signal	KB_SCANDAT	:std_logic_vector(7 downto 0);
+signal	KB_INITDONE	:std_logic;
 signal	IDAT_ALU	:std_logic_vector(7 downto 0);
 signal	ALU_OE		:std_logic;
 signal	IDAT_IOR30	:std_logic_vector(7 downto 0);
@@ -1204,6 +1702,8 @@ signal	IDAT_IOR40	:std_logic_vector(7 downto 0);
 signal	IOR40_OE	:std_logic;
 signal	IDAT_IOR6e	:std_logic_vector(7 downto 0);
 signal	IOR6e_OE	:std_logic;
+signal	IDAT_DMA	:std_logic_vector(7 downto 0);
+signal	DMA_OE		:std_logic;
 signal	IDAT_IOR71	:std_logic_vector(7 downto 0);
 signal	IOR71_OE	:std_logic;
 signal	IDAT_PPIFD	:std_logic_vector(7 downto 0);
@@ -1211,22 +1711,76 @@ signal	PPIFD_OE	:std_logic;
 signal	IDAT_PSG	:std_logic_vector(7 downto 0);
 signal	PSG_OE		:std_logic;
 signal	IDAT_SB1	:std_logic_vector(7 downto 0);
-signal	SB1_OE		:std_logic;
 signal	IDAT_SB2	:std_logic_vector(7 downto 0);
-signal	SB2_OE		:std_logic;
-signal	FM1_OE		:std_logic;
-signal	FM2_OE		:std_logic;
 signal	IDAT_COM	:std_logic_vector(7 downto 0);
-signal	COM_OE		:std_logic;
 signal	COM_CSn		:std_logic;
+signal	COM_RDn		:std_logic;
+signal	COM_WRn		:std_logic;
+signal	COM_C_Dn	:std_logic;
+signal	COM_WDAT	:std_logic_vector(7 downto 0);
+signal	IDAT_SLOW	:std_logic_vector(7 downto 0);
+signal	SLOW_OE		:std_logic;
+signal	SLOW_WAITn	:std_logic;
 signal	IO_WAIT		:std_logic;
+signal	FMWSEL		:std_logic;
+signal	sb2c		:std_logic;
+signal	sbnc		:std_logic;
+signal	sb2m		:std_logic;
+signal	N88VER		:std_logic;
+signal	MP_FMSEL	:std_logic;
+signal	FM_WDAT		:std_logic_vector(7 downto 0);
+signal	SB1_ADR		:std_logic;
+signal	SB2_WRn		:std_logic;
+signal	SB2_RDn		:std_logic;
+signal	M1_WAITn	:std_logic;
+signal	V1S4M		:std_logic;
+signal	TRAM_WAITn	:std_logic;
+signal	KNJ_WAITn	:std_logic;
+signal	KNJWSEL		:std_logic;
+signal	TRWSEL		:std_logic;
+signal	TRWV1S		:std_logic;
+signal	WAIT_nb		:std_logic;
+signal	WAIT_other	:std_logic;
+signal	GV_WAITn	:std_logic;
+signal	GVSEL		:std_logic;
+signal	GVEN		:std_logic;
+signal	GVRET		:std_logic;
+signal	GV_other	:std_logic;
+signal	GV_M1W		:std_logic;
+signal	MEM_WAITn	:std_logic;
+signal	MEMSEL		:std_logic;
+signal	MEMEN		:std_logic;
+signal	M1_HOLD		:std_logic;
+signal	G_PLANESEL	:std_logic;
+signal	GVSTR		:std_logic;
+signal	CPUM1T5		:std_logic;
+signal	CPUM1T6		:std_logic;
+signal	CPUMRD		:std_logic;
+signal	CPUMCYC		:std_logic_vector(2 downto 0);
+signal	GVSTXA		:std_logic;
+signal	GVSTRr		:std_logic;
+signal	GVS_WAITn	:std_logic;
+signal	BUS_WAITn	:std_logic;
+signal	BUSSEL,BUSIOSEL	:std_logic;
+signal	BUSWEN	:std_logic;
+signal	GVSIOC,GVSACK	:std_logic;
+signal	BUS_other	:std_logic;
+signal	GVSEN		:std_logic;
 signal	IDAT_INTC	:std_logic_vector(7 downto 0);
 signal	INTC_OE		:std_logic;
 signal	HRTC		:std_logic;
 signal	VRTC		:std_logic;
+signal	HRTCr		:std_logic;
+signal	VRTCr		:std_logic;
+signal	CRTC_VMODE	:std_logic;
+signal	cV1S		:std_logic;
 signal	CDI			:std_logic;
+signal	CDIo		:std_logic;
+signal	CDIf		:std_logic;
 signal	CCK			:std_logic;
 signal	CSTB		:std_logic;
+signal	CCK21		:std_logic;
+signal	CSTB21		:std_logic;
 signal	C_RTC		:std_logic_vector(2 downto 0);
 signal	C_DO		:std_logic;
 signal	CD0			:std_logic;
@@ -1241,7 +1795,7 @@ signal	SPCHR		:std_logic;
 signal	REVERSE		:std_logic;
 signal	TXTLINES	:std_logic_vector(5 downto 0);
 signal	TVRMODE		:std_logic;
-signal	TVRAM_WDAT	:std_logic_vector(7 downto 0);
+signal	TVRAM_WDAT	:std_logic_vector(8 downto 0);
 signal	TVRAM_MADR	:std_logic_vector(11 downto 0);
 signal	TVRAM_WE	:std_logic;
 signal	ATTRLEN		:std_logic_vector(4 downto 0);
@@ -1249,10 +1803,8 @@ signal	TXTWINEN	:std_logic;
 signal	VRTCi		:std_logic;
 signal	PPIFD_CSn	:std_logic;
 signal	PSG_CEn		:std_logic;
-signal	SB1_CEn		:std_logic;
+signal	SB1_WRn		:std_logic;
 signal	SB2_CEn		:std_logic;
-signal	FM1_CEn		:std_logic;
-signal	FM2_CEn		:std_logic;
 
 signal	TCNV_TDAT	:std_logic_vector(7 downto 0);
 signal	TCNV_TADR	:std_logic_vector(11 downto 0);
@@ -1262,9 +1814,13 @@ signal	TCNV_RDn	:std_logic;
 signal	TCNV_BURQn	:std_logic;
 signal	TCNV_BUSACKn:std_logic;
 signal	TCNV_WADR	:std_logic_vector(11 downto 0);
-signal	TCNV_WDAT	:std_logic_vector(7 downto 0);
+signal	TCNV_WDAT	:std_logic_vector(8 downto 0);
 signal	TCNV_WE		:std_logic;
 signal	TCNV_BUSUSE	:std_logic;
+signal	RAM_RDV2	:std_logic;
+signal	tcnvcnt		:integer range 0 to 14;
+signal	tcnv_ce		:std_logic;
+signal	TCNV_V1S,TCNV_CPUMD	:std_logic;
 signal	COLORn		:std_logic;
 signal	ODAT_TCNV	:std_logic_vector(7 downto 0);
 signal	pclk		:std_logic;
@@ -1292,6 +1848,9 @@ signal	ALU2		:std_logic_vector(1 downto 0);
 signal	GDM			:std_logic_vector(1 downto 0);
 signal	PLN			:std_logic_vector(2 downto 0);
 signal	GVAM		:std_logic;
+signal	GVAMw		:std_logic;	-- GVAM for GraphALU: '0' while a posted direct write is at the port
+signal	GVDW		:std_logic;	-- this request is a direct graphic VRAM write
+signal	GVDWp		:std_logic;
 signal	NG_RAMSEL	:integer range 0 to 3;
 signal	GR_RSEL		:integer range 0 to 3;
 signal	GWME		:std_logic;
@@ -1344,8 +1903,17 @@ signal	KANJI2ADR	:std_logic_vector(16 downto 0);
 signal	KANJI2RD	:std_logic;
 
 signal	cpuclkb,subclkb	:std_logic;
+signal	subce_r,subce_f	:std_logic;
+signal	cpuce_r,cpuce_f	:std_logic;
+signal	cpuce_r0,cpuce_f0	:std_logic;
+-- CPU_rstn with its release synchronised to rclk, for the CPU side on rclk
+signal	CPU_rstnrm,CPU_rstnr	:std_logic;
 
 signal	srstn		:std_logic;
+--srstn comes from the rclk domain. Synchronise its deassertion to clk21m;
+--assertion remains asynchronous.
+signal	srstn21m	:std_logic;
+signal	srstn21		:std_logic;
 
 signal	SUB_TXM2S	:std_logic_vector(7 downto 0);
 signal	SUB_TXS2M	:std_logic_vector(7 downto 0);
@@ -1373,6 +1941,7 @@ signal	MONSFT		:std_logic_vector(7 downto 0);
 signal	VRAMWE		:std_logic_vector(3 downto 0);
 
 signal	pStr	:std_logic;
+signal	pStr21	:std_logic;
 signal	pJoy	:std_logic_vector(5 downto 0);
 signal	mdata	:std_logic_vector(5 downto 0);
 
@@ -1393,6 +1962,9 @@ signal	IEROM	:std_logic;
 signal	beepsig	:std_logic;
 signal	beepen	:std_logic;
 signal	BEEPsnd	:std_logic_vector(15 downto 0);
+signal	sing	:std_logic;
+signal	GHSM	:std_logic;
+signal	GHSMv	:std_logic;
 
 signal	OPNsft		:std_logic;
 signal	cen_opn		:std_logic;
@@ -1404,6 +1976,11 @@ signal	INTn_SB1	:std_logic;
 signal	INTn_SB2	:std_logic;
 signal	SINTM		:std_logic;
 signal	S2INTM		:std_logic;
+signal	SINTMf		:std_logic;
+signal	S2INTMf		:std_logic;
+signal	INT4f		:std_logic;
+signal	INTLf		:std_logic_vector(2 downto 0);
+signal	INTLr		:std_logic_vector(2 downto 0);
 
 signal	TXTen		:std_logic;
 signal	TenSw		:std_logic;
@@ -1412,8 +1989,10 @@ signal	sndFM	:std_logic_vector(15 downto 0);
 signal	sndFML,sndFMR	:std_logic_vector(15 downto 0);
 signal	sndPSG	:std_logic_vector(15 downto 0);
 signal	sndPSG2	:std_logic_vector(15 downto 0);
+signal	sndFMLb,sndFMRb,sndPSG2b	:std_logic_vector(15 downto 0);	-- the YM2608's output, 0 with Normal(SR)
 signal	monosnd	:std_logic_vector(15 downto 0);
 signal	sndL,sndR	:std_logic_vector(15 downto 0);
+signal	sndLw,sndRw	:std_logic_vector(17 downto 0);
 signal	snddatL,usnddatL	:std_logic_vector(15 downto 0);
 signal	snddatR,usnddatR	:std_logic_vector(15 downto 0);
 signal	SB2_ADR		:std_logic_vector(1 downto 0);
@@ -1424,7 +2003,15 @@ signal	COM_clk		:std_logic;
 signal	BS			:std_logic_vector(1 downto 0);
 constant COM_BAUD	:integer	:=9600;
 constant COM_DIV	:integer	:=(SYSCLK*1000/COM_BAUD/32)-1;
+--Cassette rates. The 8251 is fed a clock 16 times the bit rate, and clkdiv halves it.
+constant CMT_DIV_600	:integer	:=(SYSCLK*1000/600/32)-1;
+constant CMT_DIV_1200	:integer	:=(SYSCLK*1000/1200/32)-1;
 signal	COM_vDIV	:std_logic_vector(10 downto 0);
+signal	COM_MODE_BAUD	:std_logic_vector(1 downto 0);
+signal	COM_MODE_CLEN	:std_logic_vector(1 downto 0);
+signal	COM_MODE_PEN	:std_logic;
+signal	COM_MODE_PEV	:std_logic;
+signal	COM_MODE_STOP	:std_logic_vector(1 downto 0);
 signal	MTON		:std_logic;
 signal	CDS			:std_logic;
 
@@ -1435,7 +2022,7 @@ constant MOD_V1H	:std_logic_vector(1 downto 0)	:="10";
 constant MOD_V2		:std_logic_vector(1 downto 0)	:="11";
 
 signal	MTSAVE		:std_logic;
-signal	TRAM_TDAT	:std_logic_vector(7 downto 0);
+signal	TRAM_TDAT	:std_logic_vector(8 downto 0);
 signal	CRTC_CURL	:std_logic_vector(4 downto 0);
 signal	CRTC_CURC	:std_logic_vector(6 downto 0);
 signal	CRTC_CURE	:std_logic;
@@ -1444,6 +2031,13 @@ signal	CRTC_CURE	:std_logic;
 signal	FRAMADDR		:std_logic_vector(12 downto 0);
 signal	FRAMWDAT		:std_logic_vector(7 downto 0);
 signal	FRAMWR		:std_logic;
+signal	FRAM8WR		:std_logic;
+signal	SUBROMWR	:std_logic;
+signal	LOADER_OEf,LOADER_OEr	:std_logic;
+signal	LOADER_WRr,LOADER_WRd	:std_logic;
+signal	LOADER_WE	:std_logic;
+signal	RAM_WAITf	:std_logic;
+signal	RAM_WAITr	:std_logic;
 
 --DISK emulation
 signal	EMUINITDONE	:std_logic;
@@ -1451,7 +2045,6 @@ signal	EMUINITDONE	:std_logic;
 
 signal	FDE_ADDR	:std_logic_vector(22 downto 0);
 signal	FDE_ADDRW	:std_logic_vector(RAMAWIDTH-1 downto 0);
-signal	FDE_RD		:std_logic;
 signal	FDE_WR		:std_logic;
 signal	FDE_WDAT	:std_logic_vector(15 downto 0);
 signal	FDE_RDAT	:std_logic_vector(15 downto 0);
@@ -1465,6 +2058,19 @@ signal	FEC_WDAT	:std_logic_vector(15 downto 0);
 signal	FEC_RDAT	:std_logic_vector(15 downto 0);
 signal	FEC_RAMWAIT	:std_logic;
 
+--Disk emulation <-> SDRAM controller: sdrbridge on clk21m, the request and
+--acknowledge toggles through synchronizers, the rest held by the sender.
+signal	FDE_REQ,FDE_REQr,FDE_ACK,FDE_ACKf	:std_logic;
+signal	FDE_RADR	:std_logic_vector(RAMAWIDTH-1 downto 0);
+signal	FDE_RWR		:std_logic;
+signal	FDE_RWDAT	:std_logic_vector(15 downto 0);
+signal	FDE_RRDAT	:std_logic_vector(15 downto 0);
+signal	FEC_REQ,FEC_REQr,FEC_ACK,FEC_ACKf	:std_logic;
+signal	FEC_RADR	:std_logic_vector(RAMAWIDTH-1 downto 0);
+signal	FEC_RWR		:std_logic;
+signal	FEC_RWDAT	:std_logic_vector(15 downto 0);
+signal	FEC_RRDAT	:std_logic_vector(15 downto 0);
+
 --OPNA
 signal	PCMADDR	:std_logic_vector(17 downto 0);
 signal	PCMADDRW	:std_logic_vector(RAMAWIDTH-1 downto 0);
@@ -1473,6 +2079,13 @@ signal	PCMWR		:std_logic;
 signal	PCMRDAT	:std_logic_vector(7 downto 0);
 signal	PCMWDAT	:std_logic_vector(7 downto 0);
 signal	PCMRWAIT	:std_logic;
+--ADPCM RAM <-> SDRAM controller: sdrbridge on clk21m, as for the disk emulation.
+signal	SND_REQ,SND_REQr,SND_ACK,SND_ACKf	:std_logic;
+signal	SND_RADR	:std_logic_vector(RAMAWIDTH-1 downto 0);
+signal	SND_RWR		:std_logic;
+signal	SND_RWDAT	:std_logic_vector(15 downto 0);
+signal	SND_RRDAT	:std_logic_vector(15 downto 0);
+signal	SND_RDAT	:std_logic_vector(15 downto 0);
 
 --video signal
 signal	vidR3	:std_logic_vector(2 downto 0);
@@ -1491,7 +2104,27 @@ signal	hdmiclk	:std_logic;
 signal	subdat	:std_logic_vector(7 downto 0);
 begin
 
-	MODE <=	pDip(1 downto 0);
+	--The OSD settings come from hps_io on clk21m and are used on rclk on every clock.
+	--They cross in one handshake, sent again and again, so all of them change on the
+	--same rclk edge and a change on the OSD is never taken half done.
+	cfg_a<=pCoreConfig(4 downto 1) & pDip(9) & pDip(6 downto 4) & pDip(2 downto 0);
+	CFGX	:cdc_hs generic map(11,1) port map(
+		a_start	=>'1',
+		a_data	=>cfg_a,
+		a_busy	=>cfg_busy,
+		a_done	=>cfg_done,
+		a_rdata	=>open,
+		a_clk	=>clk21m,
+		a_rstn	=>srstn21,
+
+		b_valid	=>open,
+		b_data	=>cfg_r,
+		b_rdata	=>"0",
+		b_clk	=>rclk,
+		b_rstn	=>srstn
+	);
+
+	MODE <=	cfg_r(1 downto 0);
 
 	cHS	<=	'1' when MODE=MOD_V1H else
 			'1' when MODE=MOD_V2 else
@@ -1503,22 +2136,44 @@ begin
 			'0';
 	cN <=	'0' when MODE=MOD_N else
 			'1';
+	--V1S hardware: V1S, and N (N-BASIC runs on it with NEW ON 1).
+	cV1S <=	'1' when MODE=MOD_V1S else
+			'1' when MODE=MOD_N else
+			'0';
 
-	cBT		<=pDip(2);
-	c40C	<=pDip(4);
-	c20L	<=pDip(5);
-	cDisk	<=pDip(6);
+	cBT		<=cfg_r(2);
+	c40C	<=cfg_r(3);
+	c20L	<=cfg_r(4);
+	cDisk	<=cfg_r(5);
 
 	MTSAVE	<=pDip(3);
 
-	CPUMD<=pDip(9);
+	CPUMD<=cfg_r(6);
+	cSB2r<=cfg_r(7);
+	cSBNr<=not(cfg_r(7) or cfg_r(8));
 
 	process(clk21m) begin
 		if (clk21m' event and clk21m='1') then
 			cInDev	<=pCoreConfig(0);
 			cSB2	<=pCoreConfig(1);
+			cSBN	<=not(pCoreConfig(1) or pCoreConfig(2));
 		end if;
 	end process;
+
+	--The video timing changes only at reset. Both bits are sampled together and taken
+	--only when two samples agree, so a change of the OSD option is never taken half done.
+	process(rclk)begin
+		if(rclk' event and rclk='1')then
+			VTm<=cfg_r(10 downto 9);
+			VTm2<=VTm;
+			if(CPU_rstnr='0' and VTm=VTm2)then
+				VT24<=VTm(1) or VTm(0);
+				VT15<=VTm(1);
+			end if;
+		end if;
+	end process;
+	pVideo24k<=VT24;
+	T24<=VT24 and not VT15;
 
 	srstna<=plllocked;	--LOADER_DONE and 
 	
@@ -1534,11 +2189,21 @@ begin
 			end if;
 		end if;
 	end process;
+
+	process(clk21m,srstn)begin
+		if(srstn='0')then
+			srstn21m<='0';
+			srstn21<='0';
+		elsif(clk21m' event and clk21m='1')then
+			srstn21m<='1';
+			srstn21<=srstn21m;
+		end if;
+	end process;
 	
-	CPU	:T80a generic map(0)
+	CPU	:T80a_ce generic map(0)
 	port map(
-		RESET_n	=>CPU_rstn,
-		CLK_n	=>CPU_clk,
+		RESET_n	=>CPU_rstnr,
+		CLK_n	=>rclk,
 --		CLK_n	=>slowclk,
 --		CLK_n	=>pPsw(0),
 		WAIT_n	=>WAIT_n,
@@ -1554,7 +2219,14 @@ begin
 		HALT_n	=>open,
 		BUSAK_n	=>BUSACK_n,
 		A		=>CPUADRp,
-		D		=>CPUDAT
+		D		=>CPUDAT,
+		DOUT	=>CPUDAT_W,
+		CE_R	=>cpuce_r,
+		CE_F	=>cpuce_f,
+		M1T5	=>CPUM1T5,
+		M1T6	=>CPUM1T6,
+		MRD		=>CPUMRD,
+		MCYC	=>CPUMCYC
 	);
 
 	IORQ_n	<=IORQ_np	when BUSACK_n='1' else '1';
@@ -1565,13 +2237,40 @@ begin
 	
 
 
-	VRTCi<=not VRTC;
+	--HRTC/VRTC are combinational outputs of the rclk domain (synccont2.vhd). TRAMCONV
+	--takes them from these registers, which it needed when it ran on clk21m; they keep
+	--the step at which it sees them. The added latency is one rclk period.
+	process(rclk)begin
+		if(rclk' event and rclk='1')then
+			HRTCr<=HRTC;
+			VRTCr<=VRTC;
+		end if;
+	end process;
+	--Port 40h below keeps the raw VRTC; this path gains one rclk cycle of latency.
+	VRTCi<=not VRTCr;
 
-	INT0n<=not INT_COMRX;
+	-- The interrupt controller runs on rclk with the CPU. The 8251, the 600Hz timer and
+	-- the sound chips run on clk21m, so each of their lines crosses as one bit. The two
+	-- sound lines are combined with their masks on clk21m first: synchronized apart, the
+	-- two could swap on the same clk21m edge and give a false falling edge. The lines
+	-- are registered on clk21m before they cross, as the combined line can glitch.
+	SINTMs	:cdc_sync2 port map(SINTM,SINTMf,clk21m);
+	S2INTMs	:cdc_sync2 port map(S2INTM,S2INTMf,clk21m);
+	INT4f<=(INTn_OPN or SINTMf) and (INTn_FM2 or S2INTMf);
+	process(clk21m)begin
+		if(clk21m' event and clk21m='1')then
+			INTLf<=INT4f & RTI & INT_COMRX;
+		end if;
+	end process;
+	INT0s	:cdc_sync2 port map(INTLf(0),INTLr(0),rclk);
+	INT2s	:cdc_sync2 port map(INTLf(1),INTLr(1),rclk);
+	INT4s	:cdc_sync2 port map(INTLf(2),INTLr(2),rclk);
+
+	INT0n<=not INTLr(0);
 	INT1n<=VRTCi;
-	INT2n<=RTI;
+	INT2n<=INTLr(1);
 	INT3n<='1';
-	INT4n<=(INTn_OPN or SINTM) and (INTn_FM2 or S2INTM);
+	INT4n<=INTLr(2);
 	INT5n<='1';
 	INT6n<='1';
 	INT7n<='1';
@@ -1584,7 +2283,7 @@ begin
 	RDn			=>RD_n,
 	M1n			=>M1_n,
 	RFRSHn		=>REFRSHn,
-	DATIN		=>CPUDAT,
+	DATIN		=>CPUDAT_W,
 	DATOUT		=>IDAT_INTC,
 	DATOE		=>INTC_OE,
 
@@ -1599,18 +2298,21 @@ begin
 	INT6n		=>INT6n,
 	INT7n		=>INT7n,
 	
-	cpuclk		=>CPU_clk,
-	clk			=>clk21m,
-	rstn		=>CPU_rstn
+	cpuclk		=>rclk,
+	ce_r		=>cpuce_r,
+	ce_f		=>cpuce_f,
+	clk			=>rclk,
+	rstn		=>CPU_rstnr,
+	rstnc		=>CPU_rstnr
 	);
 	
-	MMAP	:memorymaps generic map(1,RAMAWIDTH) port map(
+	MMAP	:memorymaps generic map(RAMAWIDTH) port map(
 	CPU_ADR		=>CPUADR,
 	CPU_MREQn	=>MREQ_n,
 	CPU_IORQn	=>IORQ_n,
 	CPU_RDn		=>RD_n,
 	CPU_WRn		=>WR_n,
-	CPU_WDAT	=>CPUDAT,
+	CPU_WDAT	=>CPUDAT_W,
 	CPU_RDAT	=>IDAT_MAP,
 	CPU_OE		=>MAP_OE,
 	
@@ -1633,31 +2335,53 @@ begin
 	
 	G_EXTMODE	=>GVAM,
 	G_RAMSEL	=>NG_RAMSEL,
+	G_PLANESEL	=>G_PLANESEL,
 	ALUOE		=>ALU_OE,
 	ALUME		=>GRAM_M_OE,
 	ALURE		=>ALU_RE,
 	GADR_MSEL	=>GWME,
 	
-	clk			=>CPU_clk,
-	rstn		=>CPU_rstn
+	EXTTYPE		=>FILL_RTYPE,
+
+	clk			=>rclk,
+	rstn		=>CPU_rstnr,
+	ce			=>cpuce_r
 );
 
 
 
 --	pLed<=TRAM_CE & TVRAM_CE & RAM_CE & IORQ_n & CPUADR(15 downto 12);
 	
+	-- The loader runs on clk21m and holds the address and data until the write is
+	-- acknowledged (ioctl_wait), so only the write and the select cross to rclk, one
+	-- bit each. LOADER_OE is an AND of two clk21m registers: register it before it crosses.
+	process(clk21m)begin
+		if(clk21m' event and clk21m='1')then
+			LOADER_OEf<=LOADER_OE;
+		end if;
+	end process;
+	LDROEs	:cdc_sync2 port map(LOADER_OEf,LOADER_OEr,rclk);
+	LDRWRs	:cdc_sync2 port map(LOADER_WR,LOADER_WRr,rclk);
+	-- The font RAMs take one write per byte, on the clock the write arrives.
+	process(rclk)begin
+		if(rclk' event and rclk='1')then
+			LOADER_WRd<=LOADER_WRr;
+		end if;
+	end process;
+	LOADER_WE<=LOADER_WRr and not LOADER_WRd;
+
 	RAMADR<=
-			ADDR_BACKRAM(RAMAWIDTH-1 downto 19) & CLR_ADR when CLR_OE='1' else
-			ADDR_N88(RAMAWIDTH-1 downto 19) & LOADER_ADR when LOADER_OE='1' else
+			ADDR_BACKRAM(RAMAWIDTH-1 downto 22) & CLR_ADR when CLR_OE='1' else
+			ADDR_N88(RAMAWIDTH-1 downto 19) & LOADER_ADR when LOADER_OEr='1' else
 			VMAP_RADR when TCNV_BUSUSE='1' else
 			MAP_RADR;
 	RAM_WDAT<=	CLR_WDAT when CLR_OE='1' else 
-				LOADER_WDAT when LOADER_OE='1' else
-				 CPUDAT;
+				LOADER_WDAT when LOADER_OEr='1' else
+				 CPUDAT_W;
 	RAM_WR<=	CLR_WR when CLR_OE='1' else
-				LOADER_WR when LOADER_OE='1' else
+				LOADER_WRr when LOADER_OEr='1' else
 				(RAM_CE and (not WR_n));
-	RAM_RD<='0' when (LOADER_OE='1' or CLR_OE='1') else
+	RAM_RD<='0' when (LOADER_OEr='1' or CLR_OE='1') else
 			not TCNV_RDn when TCNV_BUSUSE='1' else
 			'1' when KANJI1RD='1' or KANJI2RD='1' else
 			(RAM_CE and (not RD_n));
@@ -1666,7 +2390,11 @@ begin
 	
 	FRAMADDR<=LOADER_ADR(12 downto 0);
 	FRAMWDAT<=LOADER_WDAT;
-	FRAMWR<=	LOADER_WR when LOADER_OE='1' and LOADER_ADR(18 downto 13)=ADDR_FONT(18 downto 13) else '0';
+	FRAMWR<=	LOADER_WE when LOADER_OEr='1' and LOADER_ADR(18 downto 13)=ADDR_FONT(18 downto 13) else '0';
+	--8x8 font for 24kHz and 15kHz timing, from the kanji ROM. Loaded whatever the timing.
+	FRAM8WR<=	LOADER_WE when LOADER_OEr='1' and LOADER_ADR(18 downto 11)=ADDR_FONT8(18 downto 11) else '0';
+	--Sub CPU ROM, kept in block RAM with the sub CPU RAM (SUBMEM).
+	SUBROMWR<=	LOADER_WE when LOADER_OEr='1' and LOADER_ADR(18 downto 13)=ADDR_SUBROM(18 downto 13) else '0';
 
 	GALU	:GraphALU
 port map(
@@ -1692,12 +2420,12 @@ port map(
 	
 	PLN		=>PLN,
 
-	GVAM	=>GVAM,
+	GVAM	=>GVAMw,
 	GAM		=>GAM,
 	NSEL	=>NG_RAMSEL,
 
-	clk		=>clk21m,
-	rstn	=>CPU_rstn
+	clk		=>rclk,
+	rstn	=>CPU_rstnr
 );
 	
 
@@ -1713,7 +2441,72 @@ port map(
 	GRAMADRW<=ADDR_GVRAM(RAMAWIDTH-1 downto 15) & GRAMADR & '0';
 	FDE_ADDRW<=ADDR_FDEMU(RAMAWIDTH-1 downto 23) & FDE_ADDR(22 downto 0);
 	FEC_ADDRW<=ADDR_FDEMU(RAMAWIDTH-1 downto 23) & FEC_ADDR(22 downto 0);
+
+	FDEB	:sdrbridge generic map(RAMAWIDTH,true) port map(
+		ADR		=>FDE_ADDRW,
+		RD		=>'0',
+		WR		=>FDE_WR,
+		WDAT	=>FDE_WDAT,
+		RDAT	=>FDE_RDAT,
+		WAITo	=>FDE_RAMWAIT,
+
+		REQ		=>FDE_REQ,
+		REQADR	=>FDE_RADR,
+		REQWR	=>FDE_RWR,
+		REQWDAT	=>FDE_RWDAT,
+		ACK		=>FDE_ACKf,
+		ACKRDAT	=>FDE_RRDAT,
+
+		clk		=>clk21m,
+		rstn	=>srstn21
+	);
+	FDEREQs	:cdc_sync2 port map(FDE_REQ,FDE_REQr,rclk);
+	FDEACKs	:cdc_sync2 port map(FDE_ACK,FDE_ACKf,clk21m);
+
+	FECB	:sdrbridge generic map(RAMAWIDTH,false) port map(
+		ADR		=>FEC_ADDRW,
+		RD		=>FEC_RD,
+		WR		=>FEC_WR,
+		WDAT	=>FEC_WDAT,
+		RDAT	=>FEC_RDAT,
+		WAITo	=>FEC_RAMWAIT,
+
+		REQ		=>FEC_REQ,
+		REQADR	=>FEC_RADR,
+		REQWR	=>FEC_RWR,
+		REQWDAT	=>FEC_RWDAT,
+		ACK		=>FEC_ACKf,
+		ACKRDAT	=>FEC_RRDAT,
+
+		clk		=>clk21m,
+		rstn	=>srstn21
+	);
+	FECREQs	:cdc_sync2 port map(FEC_REQ,FEC_REQr,rclk);
+	FECACKs	:cdc_sync2 port map(FEC_ACK,FEC_ACKf,clk21m);
 	PCMADDRW<=ADDR_ADPCM(RAMAWIDTH-1 downto 18) & PCMADDR;
+
+	SNDB	:sdrbridge generic map(RAMAWIDTH,false) port map(
+		ADR		=>PCMADDRW,
+		RD		=>PCMRD,
+		WR		=>PCMWR,
+		WDAT	=>x"00" & PCMWDAT,
+		RDAT	=>SND_RDAT,
+		WAITo	=>PCMRWAIT,
+
+		REQ		=>SND_REQ,
+		REQADR	=>SND_RADR,
+		REQWR	=>SND_RWR,
+		REQWDAT	=>SND_RWDAT,
+		ACK		=>SND_ACKf,
+		ACKRDAT	=>SND_RRDAT,
+
+		clk		=>clk21m,
+		rstn	=>srstn21
+	);
+	PCMRDAT<=SND_RDAT(7 downto 0);
+	SND_RRDAT(15 downto 8)<=(others=>'0');
+	SNDREQs	:cdc_sync2 port map(SND_REQ,SND_REQr,rclk);
+	SNDACKs	:cdc_sync2 port map(SND_ACK,SND_ACKf,clk21m);
 
 	RAM	:SDRAMCde0cvDEMU2 generic map(RAMCAWIDTH,RAMAWIDTH,ramclk/1000,64000/8192)
 	port map(
@@ -1729,23 +2522,29 @@ port map(
 		PMEMADR			=>pMemAdr,
 		PMEMDAT			=>pMemDat,
 
-		CPUADR			=>RAMADR,
+		CPUADR			=>RAMADRo,
 		CPURDAT			=>IDAT_RAM,
-		CPUWDAT			=>RAM_WDAT,
-		CPUWR			=>RAM_WR,
-		CPURD			=>RAM_RD,
-		CPUWAIT			=>RAM_WAIT,
+		CPUWDAT			=>RAM_WDATo,
+		CPUWR			=>RAM_WRo,
+		CPURD			=>RAM_RDo,
+		CPURDV2			=>RAM_RDV2,
+		CPUWAIT			=>RAM_WAITi,
 		CPUCLK			=>cpuclkb,
 		-- CPURSTn			=>CLR_rstn,
 		MRAMDAT			=>TCNV_RDAT,
 		
+		-- The sub CPU memory is in SUBMEM: no sub CPU requests reach the controller.
 		SUBADR			=>SUBADR,
-		SUBRDAT			=>SUBRDAT,
+		SUBRDAT			=>open,
 		SUBWDAT			=>SUBWDAT,
-		SUBWR			=>SUBWR,
-		SUBRD			=>SUBRD,
-		SUBWAIT			=>SUBWAIT,
+		SUBWR			=>'0',
+		SUBRD			=>'0',
+		SUBWAIT			=>open,
 		SUBCLK			=>subclkb,
+		SUBCE_R			=>subce_r,
+		SUBCE_F			=>subce_f,
+		CPUCE_R			=>cpuce_r0,
+		CPUCE_F			=>cpuce_f0,
 
 		ALURD0			=>GRDAT0,
 		ALURD1			=>GRDAT1,
@@ -1756,7 +2555,7 @@ port map(
 		ALUWD0			=>GWDAT0,
 		ALUWD1			=>GWDAT1,
 		ALUWD2			=>GWDAT2,
-		VRAMWE			=>VRAMWE,
+		VRAMWE			=>VRAMWEo,
 		
 		VIDADR			=>GRAMADRW,
 		VIDDAT0			=>GRAMDAT0,
@@ -1765,26 +2564,26 @@ port map(
 		VIDRD			=>GRAMRD,
 		VIDWAIT			=>GRAMWAIT,
 		
-		FDEADR			=>FDE_ADDRW,
-		FDERD			=>FDE_RD,
-		FDEWR			=>FDE_WR,
-		FDERDAT			=>FDE_RDAT,
-		FDEWDAT			=>FDE_WDAT,
-		FDEWAIT			=>FDE_RAMWAIT,
+		FDEADR			=>FDE_RADR,
+		FDEREQ			=>FDE_REQr,
+		FDEWR			=>FDE_RWR,
+		FDERDAT			=>FDE_RRDAT,
+		FDEWDAT			=>FDE_RWDAT,
+		FDEACK			=>FDE_ACK,
 		
-		FECADR			=>FEC_ADDRW,
-		FECRD			=>FEC_RD,
-		FECWR			=>FEC_WR,
-		FECRDAT			=>FEC_RDAT,
-		FECWDAT			=>FEC_WDAT,
-		FECWAIT			=>FEC_RAMWAIT,
+		FECADR			=>FEC_RADR,
+		FECREQ			=>FEC_REQr,
+		FECWR			=>FEC_RWR,
+		FECRDAT			=>FEC_RRDAT,
+		FECWDAT			=>FEC_RWDAT,
+		FECACK			=>FEC_ACK,
 		
-		SNDADR			=>PCMADDRW,
-		SNDRD				=>PCMRD,
-		SNDWR				=>PCMWR,
-		SNDRDAT			=>PCMRDAT,
-		SNDWDAT			=>PCMWDAT,
-		SNDWAIT			=>PCMRWAIT,
+		SNDADR			=>SND_RADR,
+		SNDREQ			=>SND_REQr,
+		SNDWR				=>SND_RWR,
+		SNDRDAT			=>SND_RRDAT(7 downto 0),
+		SNDWDAT			=>SND_RWDAT(7 downto 0),
+		SNDACK			=>SND_ACK,
 		SNDH_Ln			=>'0',
 
 		monout			=>open,
@@ -1795,29 +2594,175 @@ port map(
 		rstn			=>srstn
 	);
 
-	CLR_OE<='0';
+	-- The RAM is filled after the boot ROM download, as a real machine of the RAM
+	-- type in the OSD has it at power on, and again at a reset after the type was
+	-- changed. RAMTYPECTL decides on clk21m and sends the type with the fill command;
+	-- the CPUs are held in reset until the fill is done.
+	RTC	:RAMTYPECTL port map(
+		OSDTYPE	=>RAMTYPE,
+		LDONE	=>LOADER_DONE,
+		CPURSTN	=>CPU_rstn,
+		FILLDONE	=>FILLDONE21,
+
+		START	=>RTC_START,
+		CTYPE	=>RTC_CTYPE,
+		BUSY	=>RTC_BUSY,
+		ACKD	=>RTC_ACKD,
+
+		RELOK	=>RTC_RELOK,
+
+		clk		=>clk21m
+	);
+	FILLCMD	:cdc_hs generic map(2,1) port map(
+		a_start	=>RTC_START,
+		a_data	=>RTC_CTYPE,
+		a_busy	=>RTC_BUSY,
+		a_done	=>RTC_ACKD,
+		a_rdata	=>open,
+		a_clk	=>clk21m,
+		a_rstn	=>srstn21,
+
+		b_valid	=>FILL_CMD,
+		b_data	=>FILL_CTYPE,
+		b_rdata	=>"0",
+		b_clk	=>rclk,
+		b_rstn	=>srstn
+	);
+	FILL	:RAMFILL port map(
+		CMD		=>FILL_CMD,
+		CTYPE	=>FILL_CTYPE,
+		RAM_WAIT	=>RAM_WAIT,
+
+		ADR		=>CLR_ADR,
+		WDAT	=>CLR_WDAT,
+		WR		=>CLR_WR,
+		OE		=>CLR_OE,
+
+		SADR	=>FILL_SADR,
+		SWDAT	=>FILL_SWDAT,
+		SWR		=>FILL_SWR,
+
+		DONE	=>FILLDONE,
+		RTYPE	=>FILL_RTYPE,
+
+		clk		=>rclk,
+		rstn	=>srstn
+	);
+	FILLDONEs	:cdc_sync2 port map(FILLDONE,FILLDONE21,clk21m);
+
+	-- CPU writes outside graphic VRAM are posted: a real FH has no wait state on
+	-- them at 4MHz and one at 8MHz (MEMWAIT), with the SDRAM write done later.
+	-- Graphic VRAM writes through the ALU are not, as the port reads the ALU
+	-- while it writes. Direct graphic VRAM writes in V1S and N are posted too:
+	-- a real FH waits on them as long as on a read.
+	RAM_POST<='1' when CLR_OE='0' and LOADER_OEr='0' and TCNV_BUSUSE='0' and (GVSEL='0' or GVSEN='1') else '0';
+	-- A direct graphic VRAM write in V1S or N writes the CPU byte on the planes
+	-- latched in WRPOST. While such a write is posted, GraphALU is kept in that
+	-- mode, so a later OUT to the ALU registers does not change what it writes.
+	GVDW<=GVSEL and GVSEN;
+	GVAMw<=GVAM and not GVDWp;
+	-- Text DMA reads keep to window 1, so the text timing does not change.
+	RAM_RDV2<=not TCNV_BUSUSE;
+	WRP	:WRPOST generic map(RAMAWIDTH) port map(
+		RD		=>RAM_RD,
+		WR		=>RAM_WR,
+		POST	=>RAM_POST,
+		ADR		=>RAMADR,
+		WDAT	=>RAM_WDAT,
+		WE		=>VRAMWE,
+		KIND	=>GVDW,
+		WAITo	=>RAM_WAIT,
+
+		oRD		=>RAM_RDo,
+		oWR		=>RAM_WRo,
+		oADR	=>RAMADRo,
+		oWDAT	=>RAM_WDATo,
+		oWE		=>VRAMWEo,
+		oKIND	=>GVDWp,
+		WAITi	=>RAM_WAITi,
+
+		clk		=>rclk,
+		rstn	=>srstn
+	);
 	-- loader_rstn<=CLR_rstn;
 	
-	LOADER_ACK<=not RAM_WAIT;
+	-- The loader waits for the acknowledge on clk21m. RAM_WAIT is combinational:
+	-- register it on rclk before it crosses so a glitch can't be taken as the end.
+	process(rclk)begin
+		if(rclk' event and rclk='1')then
+			RAM_WAITr<=RAM_WAIT;
+		end if;
+	end process;
+	LDRACKs	:cdc_sync2 port map(RAM_WAITr,RAM_WAITf,clk21m);
+	LOADER_ACK<=not RAM_WAITf;
 	
 --	CPU_rstn<=rstn and LOADER_DONE and EMUINITDONE;
+	-- Once released, the CPUs stay out of reset until the next reset: RTC_RELOK goes
+	-- low when only the OSD RAM type is changed, which must not reset them.
+	-- They are released only when a transfer of the OSD settings has just been taken
+	-- on rclk with the video timing set now, so VTm takes that timing before the
+	-- release. cfg_vt is the timing CFGX takes when it starts a transfer.
+	process(clk21m)begin
+		if(clk21m' event and clk21m='1')then
+			if(cfg_busy='0')then
+				cfg_vt<=cfg_a(10 downto 9);
+			end if;
+		end if;
+	end process;
 	process(clk21m,rstn,srstna)begin
 		if(rstn='0' or srstna='0')then
 			CPU_rstn<='0';
 		elsif(clk21m' event and clk21m='1')then
-			if(LOADER_DONE='1' and EMUINITDONE='1')then
+			if(LOADER_DONE='1' and EMUINITDONE='1' and RTC_RELOK='1' and cfg_done='1' and cfg_vt=cfg_a(10 downto 9))then
 				CPU_rstn<='1';
-			else
-				CPU_rstn<='0';
 			end if;
 		end if;
 	end process;
 
+	-- CPU_rstn is released in the clk21m domain. Release it again on rclk for
+	-- the CPU side, which runs on rclk.
+	process(rclk,CPU_rstn)begin
+		if(CPU_rstn='0')then
+			CPU_rstnrm<='0';
+			CPU_rstnr<='0';
+		elsif(rclk' event and rclk='1')then
+			CPU_rstnrm<='1';
+			CPU_rstnr<=CPU_rstnrm;
+		end if;
+	end process;
+
+	--In 24kHz and 15kHz timing the dot enable is 3 to 6 clocks apart, so the text RAM
+	--ports used by the CPU and by TRAMCONV take every clock instead.
+	TCROSS_ce<='1' when VT24='1' else vid_ce3;
+
+	--TRAMCONV runs on rclk and takes a step 4 times in 15 clocks: 20MHz, the speed
+	--it had on clk21m, so its step counts (the V1S bus hold) keep their length.
+	process(rclk)begin
+		if(rclk' event and rclk='1')then
+			if(tcnvcnt=14)then
+				tcnvcnt<=0;
+			else
+				tcnvcnt<=tcnvcnt+1;
+			end if;
+			if(tcnvcnt=3 or tcnvcnt=7 or tcnvcnt=11 or tcnvcnt=14)then
+				tcnv_ce<='1';
+			else
+				tcnv_ce<='0';
+			end if;
+		end if;
+	end process;
+
+	--not cHS equals cV1S in all four modes, so one bit gives both TMODE and V1S.
+	TCNV_V1S<=cV1S;
+	TCNV_CPUMD<=CPUMD;
+
 	TRAM	:TEXTRAM port map(
 		address_a		=>TRAM_ADR,
 		address_b		=>TCNV_TADR,
-		clock			=>gclk,
-		data_a			=>CPUDAT,
+		clock			=>rclk,
+		ce_a			=>TCROSS_ce,
+		ce_b			=>'1',	--read by TRAMCONV only, one step (3 or 4 clocks) later
+		data_a			=>CPUDAT_W,
 		data_b			=>(others=>'0'),
 		wren_a			=>TRAM_CE and (not WR_n),
 		wren_b			=>'0',
@@ -1829,7 +2774,7 @@ port map(
 	T2V	:TRAMCONV
 	port map(
 	TVRMODE		=>TVRMODE,
-	TMODE		=>not cHS,
+	TMODE		=>TCNV_V1S,
 	SMODE		=>SMODE,
 	COLOR		=>not COLORn,
 	ATTRCOLOR	=>ATTRCOLOR,
@@ -1837,6 +2782,14 @@ port map(
 	TEXTEN		=>CRTCen and TDMAEN,
 	ATTRLEN		=>ATTRLEN,
 	TXTLINES	=>TXTLINES,
+
+	V1S			=>TCNV_V1S,
+	VMODE		=>CRTC_VMODE,
+	CPUMD		=>TCNV_CPUMD,
+	GVSTR		=>GVSTRr,
+	VT24		=>VT24,
+	VT15		=>VT15,
+	TSET		=>CRTC_TSET,
 	
 	TADR_TOP	=>TRAMTOP,
 
@@ -1849,7 +2802,7 @@ port map(
 	MRAM_WAIT	=>RAM_WAIT,
 	BUS_USE		=>TCNV_BUSUSE,
 	
-	BUSREQn		=>BUSRQ_n,
+	BUSREQn		=>BUSRQ_nf,
 	BUSACKn		=>BUSACK_n,
 	
 
@@ -1857,15 +2810,20 @@ port map(
 	TVRAM_WDAT	=>TCNV_WDAT,
 	TVRAM_WR	=>TCNV_WE,
 	
-	VRET		=>VRTC,
-	HRET		=>HRTC,
+	VRET		=>VRTCr,
+	HRET		=>HRTCr,
 	-- DONE		=>TCNVDONE,
 	
-	clk			=>clk21m,
-	rstn		=>CPU_rstn
+	CPUBUS		=>BUSSEL,
+	CPUM1n		=>M1_n,
+	clk			=>rclk,
+	ce			=>tcnv_ce,
+	rstn		=>CPU_rstnr
 );
+	-- Two clocks to the CPU, as when TRAMCONV ran on clk21m.
+	BRQs	:cdc_sync2 port map(BUSRQ_nf,BUSRQ_n,rclk);
 
-	TVRAM_WDAT	<=CPUDAT					when TMODE='0' and TVRMODE='1' else TCNV_WDAT;
+	TVRAM_WDAT	<='0' & CPUDAT_W			when TMODE='0' and TVRMODE='1' else TCNV_WDAT;
 	TVRAM_ADR	<=TVRAM_MADR 				when TMODE='0' and TVRMODE='1' else TCNV_WADR;
 	TVRAM_WE	<=TVRAM_CE and (not WR_n)	when TMODE='0' and TVRMODE='1' else TCNV_WE;
 
@@ -1875,17 +2833,20 @@ tmap	:trammaps generic map(RAMAWIDTH) port map(
 	RAM_ADR		=>VMAP_RADR
 );
 
-	TVRAM	:TEXTRAM port map(
+	TVRAM	:TEXTRAM generic map(9) port map(
 		address_a		=>TVRAM_ADR,
 		address_b		=>CRTC_TADR,
-		clock			=>gclk,
+		clock			=>rclk,
+		ce_a			=>TCROSS_ce,
+		ce_b			=>vid_ce3,
 		data_a			=>TVRAM_WDAT,
 		data_b			=>(others=>'0'),
 		wren_a			=>TVRAM_WE,
 		wren_b			=>'0',
-		q_a				=>IDAT_TVRAM,
+		q_a				=>TVRAM_QA,
 		q_b				=>TRAM_TDAT
 	);
+	IDAT_TVRAM<=TVRAM_QA(7 downto 0);
 	
 	CREG	:CRTCREGS
 generic map(
@@ -1897,7 +2858,7 @@ port map(
 	IORQn	=>IORQ_n,
 	WRn		=>WR_n,
 	RDn		=>RD_n,
-	DATIN	=>CPUDAT,
+	DATIN	=>CPUDAT_W,
 	DATOUT	=>IDAT_CRTR,
 	DATOE	=>CRTR_OE,
 
@@ -1911,24 +2872,32 @@ port map(
 	REVERSE	=>REVERSE,
 	L		=>TXTLINES,
 	S		=>SMODE,
+	C		=>CRTC_C,
 	AT0		=>ATTRCOLOR,
 	SC		=>SPCHR,
 	
 	ATTR	=>ATTRLEN,
 
-	clk		=>CPU_clk,
-	rstn	=>CPU_rstn
+	SETL	=>CRTC_SETL,
+	SETR	=>CRTC_SETR,
+	SETV	=>CRTC_SETV,
+	SETOK	=>CRTC_SETOK,
+
+	clk		=>rclk,
+	rstn	=>CPU_rstnr,
+	ce		=>cpuce_f
 );
 
 
-	WAIT_n<=	not RAM_WAIT when RAM_CE='1' else
-				not RAM_WAIT when KANJI1RD='1' else
-				not RAM_WAIT when KANJI2RD='1' else
-				IO_WAIT;
+	WAIT_nb<=	not RAM_WAIT when RAM_CE='1' else
+				TRAM_WAITn when TRAM_CE='1' else
+				(not RAM_WAIT) and KNJ_WAITn when KANJI1RD='1' or KANJI2RD='1' else
+				IO_WAIT and SLOW_WAITn;
+	WAIT_n<=WAIT_nb and M1_WAITn and MEM_WAITn and GV_WAITn and GVS_WAITn and BUS_WAITn;
 
 	
-	process(clk21m,srstn)begin
-		if(srstn='0')then
+	process(clk21m,srstn21)begin
+		if(srstn21='0')then
 			KBCLKIN<='1';
 			KBDATIN<='1';
 		elsif(clk21m' event and clk21m='1')then
@@ -1942,11 +2911,9 @@ port map(
 	pPs2Datout<=KBDATOUT;
 
 	KB	:KBMAP generic map(SYSCLK,100) port map(
-	ADR		=>CPUADR(7 downto 0),
-	IORQn	=>IORQ_n,
-	RDn		=>RD_n,
-	DAT		=>IDAT_KB,
-	OE		=>KB_OE,
+	SCANADR	=>KB_SCANADR,
+	SCANDAT	=>KB_SCANDAT,
+	INITDONE=>KB_INITDONE,
 
 	KBCLKIN	=>KBCLKIN,
 	KBCLKOUT=>KBCLKOUT,
@@ -1962,10 +2929,41 @@ port map(
 	clk		=>clk21m,
 	rstn	=>CPU_rstn
 );
+
+	KBM	:kbmirror port map(
+		ADR		=>CPUADR(7 downto 0),
+		IORQn	=>IORQ_n,
+		RDn		=>RD_n,
+		DAT		=>IDAT_KB,
+		OE		=>KB_OE,
+
+		cclk	=>rclk,
+		crstn	=>CPU_rstnr,
+
+		SCANADR	=>KB_SCANADR,
+		SCANDAT	=>KB_SCANDAT,
+		INITDONE=>KB_INITDONE,
+
+		fclk	=>clk21m,
+		frstn	=>CPU_rstn
+	);
 	
+	-- With the Sound Board set to OnBoard, N88-BASIC reads as version 1.9, as on the MA. Some software
+	-- reads this digit at 79D7h to choose between ports 44h and A8h. The setting is the one
+	-- held for the access, as for the sound ports.
+	process(rclk)begin
+		if(rclk' event and rclk='1')then
+			if(MREQ_n='1')then
+				sb2m<=cSB2r;
+			end if;
+		end if;
+	end process;
+	N88VER<='1' when sb2m='1' and MAP_RADR=ADDR_N88(RAMAWIDTH-1 downto 16) & x"79D7" else '0';
+
 	CPUDAT<=
 				IDAT_RAM	when GRAM_M_OE='1' else
 				IDAT_ALU	when ALU_OE='1' else
+				x"39"		when (N88VER='1' and RAM_CE='1' and RD_n='0') else
 				IDAT_RAM	when (RAM_CE='1' and RD_n='0') else
 				IDAT_TRAM	when (TRAM_CE='1' and RD_n='0') else
 				IDAT_TVRAM	when (TVRAM_CE='1' and RD_n='0') else
@@ -1979,34 +2977,38 @@ port map(
 				IDAT_IOR38	when IOR38_OE='1' else
 				IDAT_IOR40	when IOR40_OE='1' else
 				IDAT_IOR6e	when IOR6e_OE='1' else
+				IDAT_DMA	when DMA_OE='1' else
 				IDAT_PPIFD	when PPIFD_OE='1' else
 				IDAT_RAM	when KANJI1RD='1' else
 				IDAT_RAM	when KANJI2RD='1' else
 				IDAT_PSG	when PSG_OE='1' else
-				IDAT_COM	when COM_OE='1' else
+				IDAT_SLOW	when SLOW_OE='1' else
 				IDAT_INTC	when INTC_OE='1' else
 				(others=>'1') when IORQ_n='0' and RD_n='0' else
 				(others=>'Z');
 	
 --	pMonDBus<=CPUDAT;
 
-	IOW10	:IO_WRS generic map(x"10")port map(CPUADR(7 downto 0),IORQ_n,WR_n,CPUDAT,open,open,open,open,C_DO,C_RTC(2),C_RTC(1),C_RTC(0),CPU_clk,CPU_rstn);
+	IOW10	:IO_WRS generic map(x"10")port map(CPUADR(7 downto 0),IORQ_n,WR_n,CPUDAT_W,open,open,open,open,C_DO,C_RTC(2),C_RTC(1),C_RTC(0),rclk,CPU_rstnr,cpuce_r);
 	IOR30	:IO_RD generic map(x"30")port map(CPUADR(7 downto 0),IORQ_n,RD_n,IDAT_IOR30,IOR30_OE,'0','0','0','0',c20L,c40C,cBT,cN);
-	IOW30	:IO_WRS generic map(x"30")port map(CPUADR(7 downto 0),IORQ_n,WR_n,CPUDAT,open,open,BS(1),BS(0),MTON,CDS,COLORn,HMODE,CPU_clk,CPU_rstn);
+	IOW30	:IO_WRS generic map(x"30")port map(CPUADR(7 downto 0),IORQ_n,WR_n,CPUDAT_W,open,open,BS(1),BS(0),MTON,CDS,COLORn,HMODE,rclk,CPU_rstnr,cpuce_r);
+	--Port 30h bits for the tape path outside.
+	cmt_mton<=MTON;
+	cmt_bs<=BS;
 	IOR31	:IO_RD generic map(x"31")port map(CPUADR(7 downto 0),IORQ_n,RD_n,IDAT_IOR31,IOR31_OE,cVer,cHS,'1','1','1','0','1','1');
-	IOW31	:IO_WRS generic map(x"31")port map(CPUADR(7 downto 0),IORQ_n,WR_n,CPUDAT,open,open,open,GCOLOR,GRAPHEN,RMODE,MMODE,L200,CPU_clk,CPU_rstn);
-	IO32	:IO_RWS generic map(x"32")port map(CPUADR(7 downto 0),IORQ_n,RD_n,WR_n,CPUDAT,IDAT_IOR32,IOR32_OE,SINTM,open,PMODE,TMODE,open,open,EROMSEL1,EROMSEL0,CPU_clk,CPU_rstn);
-	IO33	:IO_RWS generic map(x"33")port map(CPUADR(7 downto 0),IORQ_n,RD_n,WR_n,CPUDAT,IDAT_IOR33,IOR33_OE,open,open,open,open,open,open,open,open,CPU_clk,CPU_rstn);
-	IOW34	:IO_WRS generic map(x"34")port map(CPUADR(7 downto 0),IORQ_n,WR_n,CPUDAT,open,ALU2(1),ALU1(1),ALU0(1),open,ALU2(0),ALU1(0),ALU0(0),CPU_clk,CPU_rstn);
-	IOW35	:IO_WRS generic map(x"35")port map(CPUADR(7 downto 0),IORQ_n,WR_n,CPUDAT,GAM,open,GDM(1),GDM(0),open,PLN(2),PLN(1),PLN(0),CPU_clk,CPU_rstn);
-	IO38	:IO_RWS generic map(x"38")port map(CPUADR(7 downto 0),IORQ_n,RD_n,WR_n,CPUDAT,IDAT_IOR38,IOR38_OE,open,open,open,open,open,open,open,TVRMODE,CPU_clk,CPU_rstn);
-	IOR40	:IO_RD generic map(x"40")port map(CPUADR(7 downto 0),IORQ_n,RD_n,IDAT_IOR40,IOR40_OE,'0','0',VRTC,CDI,cDisk,'1','0','0');
-	IOW40	:IO_WRS generic map(x"40")port map(CPUADR(7 downto 0),IORQ_n,WR_n,CPUDAT,open,pStr,beepen,open,open,CCK,CSTB,open,CPU_clk,CPU_rstn);
+	IOW31	:IO_WRS generic map(x"31")port map(CPUADR(7 downto 0),IORQ_n,WR_n,CPUDAT_W,open,open,open,GCOLOR,GRAPHEN,RMODE,MMODE,L200,rclk,CPU_rstnr,cpuce_r);
+	IO32	:IO_RWS generic map(x"32")port map(CPUADR(7 downto 0),IORQ_n,RD_n,WR_n,CPUDAT_W,IDAT_IOR32,IOR32_OE,SINTM,open,PMODE,TMODE,open,open,EROMSEL1,EROMSEL0,rclk,CPU_rstnr,cpuce_r);
+	IO33	:IO_RWS generic map(x"33")port map(CPUADR(7 downto 0),IORQ_n,RD_n,WR_n,CPUDAT_W,IDAT_IOR33,IOR33_OE,open,open,open,open,open,open,open,open,rclk,CPU_rstnr,cpuce_r);
+	IOW34	:IO_WRS generic map(x"34")port map(CPUADR(7 downto 0),IORQ_n,WR_n,CPUDAT_W,open,ALU2(1),ALU1(1),ALU0(1),open,ALU2(0),ALU1(0),ALU0(0),rclk,CPU_rstnr,cpuce_r);
+	IOW35	:IO_WRS generic map(x"35")port map(CPUADR(7 downto 0),IORQ_n,WR_n,CPUDAT_W,GAM,open,GDM(1),GDM(0),open,PLN(2),PLN(1),PLN(0),rclk,CPU_rstnr,cpuce_r);
+	IO38	:IO_RWS generic map(x"38")port map(CPUADR(7 downto 0),IORQ_n,RD_n,WR_n,CPUDAT_W,IDAT_IOR38,IOR38_OE,open,open,open,open,open,open,open,TVRMODE,rclk,CPU_rstnr,cpuce_r);
+	IOR40	:IO_RD generic map(x"40")port map(CPUADR(7 downto 0),IORQ_n,RD_n,IDAT_IOR40,IOR40_OE,'0','0',VRTC,CDI,cDisk,'1',VT15,'0');
+	IOW40	:IO_WRS generic map(x"40")port map(CPUADR(7 downto 0),IORQ_n,WR_n,CPUDAT_W,sing,pStr,beepen,GHSM,open,CCK,CSTB,open,rclk,CPU_rstnr,cpuce_r);
 	IOR6e	:IO_RD generic map(x"6e")port map(CPUADR(7 downto 0),IORQ_n,RD_n,IDAT_IOR6e,IOR6e_OE,not CPUMD,'1','1','1','1','1','1','1');
-	IOW53	:IO_WRS generic map(x"53")port map(CPUADR(7 downto 0),IORQ_n,WR_n,CPUDAT,open,open,open,open,GxDS(2),GxDS(1),GxDS(0),TEXTDS,CPU_clk,CPU_rstn);
-	IOW71	:IO_WRS generic map(x"71")port map(CPUADR(7 downto 0),IORQ_n,WR_n,CPUDAT,open,open,open,open,open,open,open,IEROM,CPU_clk,CPU_rstn);
-	IOWaa	:IO_WRS generic map(x"aa")port map(CPUADR(7 downto 0),IORQ_n,WR_n,CPUDAT,S2INTM,open,open,open,open,open,open,open,CPU_clk,CPU_rstn);
-	TDREG	:TDMAREGS generic map(x"64",x"65",x"68") port map(CPUADR(7 downto 0),IORQ_n,WR_n,CPUDAT,TRAMTOP,TRAMLEN,TDMAEN,CPU_clk,CPU_rstn);
+	IOW53	:IO_WRS generic map(x"53")port map(CPUADR(7 downto 0),IORQ_n,WR_n,CPUDAT_W,open,open,open,open,GxDS(2),GxDS(1),GxDS(0),TEXTDS,rclk,CPU_rstnr,cpuce_r);
+	IOW71	:IO_WRS generic map(x"71")port map(CPUADR(7 downto 0),IORQ_n,WR_n,CPUDAT_W,open,open,open,open,open,open,open,IEROM,rclk,CPU_rstnr,cpuce_r);
+	IOWaa	:IO_WRS generic map(x"aa")port map(CPUADR(7 downto 0),IORQ_n,WR_n,CPUDAT_W,S2INTM,open,open,open,open,open,open,open,rclk,CPU_rstnr,cpuce_r);
+	TDREG	:TDMAREGS generic map(x"64",x"65",x"68") port map(CPUADR(7 downto 0),IORQ_n,WR_n,CPUDAT_W,TRAMTOP,TRAMLEN,TDMAEN,rclk,CPU_rstnr,cpuce_r,RD_n,IDAT_DMA,DMA_OE);
 	pStrA<=pStr;
 	pStrB<=pStr;
 	
@@ -2018,7 +3020,7 @@ port map(
 		RDn		=>RD_n,
 		WRn		=>WR_n,
 		ADR		=>CPUADR(1 downto 0),
-		DATIN	=>CPUDAT,
+		DATIN	=>CPUDAT_W,
 		DATOUT	=>IDAT_PPIFD,
 		DATOE	=>PPIFD_OE,
 		
@@ -2035,8 +3037,9 @@ port map(
 		PCLo		=>SUB_HRM2S,
 		PCLoe		=>open,
 		
-		clk		=>CPU_clk,
-		rstn	=>CPU_rstn
+		clk		=>rclk,
+		rstn	=>CPU_rstnr,
+		ce		=>cpuce_r
 	);
 
 	KNJ1	:KANJIROM generic map(x"e8") port map(
@@ -2044,13 +3047,14 @@ port map(
 		IORQn	=>IORQ_n,
 		RDn		=>RD_n,
 		WRn		=>WR_n,
-		WDAT	=>CPUDAT,
+		WDAT	=>CPUDAT_W,
 		
 		KNJADR	=>KANJI1ADR,
 		KNJRD	=>KANJI1RD,
 		
-		clk		=>CPU_clk,
-		rstn	=>CPU_rstn
+		clk		=>rclk,
+		rstn	=>CPU_rstnr,
+		ce		=>cpuce_r
 	);
 
 	KNJ2	:KANJIROM generic map(x"ec") port map(
@@ -2058,29 +3062,127 @@ port map(
 		IORQn	=>IORQ_n,
 		RDn		=>RD_n,
 		WRn		=>WR_n,
-		WDAT	=>CPUDAT,
+		WDAT	=>CPUDAT_W,
 		
 		KNJADR	=>KANJI2ADR,
 		KNJRD	=>KANJI2RD,
 		
-		clk		=>CPU_clk,
-		rstn	=>CPU_rstn
+		clk		=>rclk,
+		rstn	=>CPU_rstnr,
+		ce		=>cpuce_r
 	);
 
 
 --	IOWA	:IOWAIT port map(IORQ_n,RD_n,WR_n,IO_WAIT,cpu_clk,srstn);
-	IO_WAIT	<='1';
+	-- One wait state on IN and OUT at the sound ports at 8MHz. A real FH and MA wait on IN at
+	-- 44h-47h and on OUT at 44h and 46h, whatever is fitted there. OUT at 45h and 47h is taken
+	-- to be the same, and so are A8h,A9h,ACh,ADh while Sound Board II is an add-on, as the
+	-- onboard OPNA on the MA. With no board, those ports have no wait. The settings are the
+	-- ones held for the access (sb2c, sbnc), as for the port (MP) and the chip it reaches.
+	process(rclk)begin
+		if(rclk' event and rclk='1')then
+			if(IORQ_n='1')then
+				sb2c<=cSB2r;
+				sbnc<=cSBNr;
+			end if;
+		end if;
+	end process;
+	FMWSEL<=	'1' when CPUADR(7 downto 2)="010001" else
+				'1' when sb2c='0' and sbnc='0' and CPUADR(7 downto 3)&CPUADR(1)="101010" else
+				'0';
+	MP_FMSEL<=FMWSEL when USE_OPN=5 else '0';
+	FMW		:FMWAIT port map(FMWSEL,IORQ_n,RD_n,WR_n,CPUMD,IO_WAIT,rclk,cpuce_f,CPU_rstnr);
+	-- One wait state on every opcode fetch in V1S and N at 4MHz, as measured on a real FH.
+	V1S4M<='1' when cV1S='1' and CPUMD='0' else '0';
+	WAIT_other<=not WAIT_nb;
+	-- Wait states on the high-speed RAM (F000h-, block RAM), as measured on a
+	-- real FH. They are put in WAIT_nb as for SDRAM, so the other waits count
+	-- them or come after them.
+	TRWSEL<='1' when TRAM_CE='1' and (RD_n='0' or WR_n='0') else '0';
+	TRWV1S<='1' when MODE=MOD_V1S else '0';
+	TRW		:TRAMWAIT port map(TRWSEL,RD_n,M1_n,CPUMD,cHS,TRWV1S,TRAM_WAITn,rclk,cpuce_f,CPU_rstnr);
+	-- Wait states on the kanji ROM ports, as measured on a real FH: 2 at 8MHz.
+	KNJWSEL<=KANJI1RD or KANJI2RD;
+	KNJW	:KNJWAIT port map(KNJWSEL,CPUMD,KNJ_WAITn,rclk,cpuce_f,CPU_rstnr);
+	M1W		:M1WAIT port map(M1_n,MREQ_n,WAIT_other,V1S4M,M1_WAITn,rclk,cpuce_f,CPU_rstnr);
+	-- Wait states on graphic VRAM reads and writes, as measured on a real FH:
+	-- V1H and V2, and V1S when the ALU is in use or in the high-speed mode.
+	GVSEL<='1' when RAM_CE='1' and CPUADR(15 downto 14)="11" and GWME='0' and (RD_n='0' or WR_n='0') else '0';
+	-- 40h bit 4 selects the V1S graphic high-speed mode. On a real FH it removes the
+	-- slowdown of a selected graphic VRAM and gives its accesses the V1H/V2 wait.
+	-- Only V1S with the graphic screen on, as measured; N keeps the normal mode.
+	GHSMv<='1' when MODE=MOD_V1S and GRAPHEN='1' and GHSM='1' else '0';
+	GVEN<='1' when cHS='1' else
+		'1' when MODE=MOD_V1S and GVAM='1' else
+		'1' when GHSMv='1' and GVAM='0' else
+		'0';
+	GV_other<=not (WAIT_nb and M1_WAITn and MEM_WAITn);
+	GV_M1W<=not M1_WAITn;
+	-- With the graphic screen off, a real FH gives graphic VRAM accesses the
+	-- retrace wait also while the screen is drawn.
+	GVRET<=VRTCr or not GRAPHEN;
+	GVW		:GVWAIT port map(GVSEL,GV_M1W,CPUMD,GVEN,GV_WAITn,rclk,cpuce_f,CPU_rstnr,GVRET);
+	-- V1S and N slow down the whole CPU while graphic VRAM is selected for
+	-- direct access (5Ch-5Eh) and the graphic screen is being displayed,
+	-- as measured on a real FH. Every user of cpuce_r/cpuce_f gets the
+	-- slowed enables.
+	GVSTR<='1' when cV1S='1' and G_PLANESEL='1' and GVAM='0' and GRAPHEN='1' and VRTCr='0' and GHSMv='0' else '0';
+	-- I/O read or write cycles. IORQ_n sets the window, as T80 releases
+	-- WR_n half a T before IORQ_n on I/O writes. An interrupt acknowledge
+	-- is left out as a whole: T80 raises M1_n there half a T before IORQ_n,
+	-- so GVSACK keeps it out until IORQ_n goes high. The sound ports with
+	-- their own wait (FMWSEL) are left out: on a real FH an IN A,(44h)
+	-- costs less than an IN A,(40h) or an OUT (10h),A.
+	process(rclk)begin
+		if(rclk' event and rclk='1')then
+			if(IORQ_n='1')then
+				GVSACK<='0';
+			elsif(M1_n='0')then
+				GVSACK<='1';
+			end if;
+		end if;
+	end process;
+	GVSIOC<='1' when IORQ_n='0' and M1_n='1' and GVSACK='0' and FMWSEL='0' else '0';
+	GVS		:GVSTRETCH port map(cpuce_r0,cpuce_f0,GVSTR,CPUMD,cpuce_r,cpuce_f,rclk,CPU_rstnr,T24,GVSIOC,CPUM1T5,CPUM1T6,GVSTXA,CPUMRD,CPUMCYC);
+	GVSTXA<=CRTCen and TDMAEN;
+	--TRAMCONV takes GVSTR from this register, as for VRTCr.
+	process(rclk)begin
+		if(rclk' event and rclk='1')then
+			GVSTRr<=GVSTR;
+		end if;
+	end process;
+	-- Keeps the 8MHz memory wait of a real FH while slowed down, and gives it
+	-- to posted writes, which SDRAM no longer holds.
+	MEMSEL<='1' when MREQ_n='0' and (RD_n='0' or WR_n='0') else '0';
+	PWSEL<='1' when RAM_POST='1' and RAM_CE='1' and WR_n='0' else '0';
+	MEMEN<=(GVSTR or PWSEL) and CPUMD;
+	M1_HOLD<=not M1_WAITn;
+	MEMW	:MEMWAIT port map(MEMSEL,WAIT_other,M1_HOLD,MEMEN,MEM_WAITn,rclk,cpuce_f,CPU_rstnr);
+	-- Wait states on graphic VRAM reads and writes in V1S and N with direct
+	-- access, as measured on a real FH. GVWAIT above covers the ALU.
+	GVSEN<='1' when cV1S='1' and GVAM='0' and GHSMv='0' else '0';
+	GVSW	:GVSWAIT port map(GVSEL,GV_other,CPUMD,GVSTR,GVSEN,GVS_WAITn,rclk,cpuce_f,CPU_rstnr,VT24);
+	-- While slowed down at 4MHz, a real FH also waits on every bus cycle
+	-- (BUSWAIT), after all the other waits. At 8MHz the text row transfers
+	-- in TRAMCONV give that part.
+	BUSSEL<='1' when (MREQ_n='0' or IORQ_n='0') and (RD_n='0' or WR_n='0') else '0';
+	BUSIOSEL<=not IORQ_n;
+	BUS_other<=not (WAIT_nb and M1_WAITn and MEM_WAITn and GV_WAITn and GVS_WAITn);
+	BUSWEN<=GVSTR and not CPUMD;
+	BUSW	:BUSWAIT port map(BUSSEL,BUSIOSEL,BUS_other,CPUMD,BUSWEN,BUS_WAITn,rclk,cpuce_f,CPU_rstnr);
 	
-	process(cpu_clk,srstn)begin
+	process(rclk,srstn)begin
 		if(srstn='0')then
 			slowclk<='0';
 			clkcount<=500000;
-		elsif(cpu_clk' event and cpu_clk='1')then
-			if(clkcount>0)then
-				clkcount<=clkcount-1;
-			else
-				slowclk<=not slowclk;
-				clkcount<=500000;
+		elsif(rclk' event and rclk='1')then
+			if(cpuce_r='1')then
+				if(clkcount>0)then
+					clkcount<=clkcount-1;
+				else
+					slowclk<=not slowclk;
+					clkcount<=500000;
+				end if;
 			end if;
 		end if;
 	end process;
@@ -2091,7 +3193,7 @@ port map(
 	IORQn		=>IORQ_n,
 	WRn			=>WR_n,
 	ADR			=>CPUADR(7 downto 0),
-	WDAT		=>CPUDAT,
+	WDAT		=>CPUDAT_W,
 	PALEN		=>'1',
 	
 	TRAM_ADR	=>CRTC_TADR,
@@ -2135,26 +3237,41 @@ port map(
 	--VRTC		=>VID_VRTC,
 	HRTC		=>HRTC,
 	VRTC		=>VRTC,
+	CURVMODE	=>CRTC_VMODE,
 	
 	FRAMWADR	=>FRAMADDR,
 	FRAMWDAT	=>FRAMWDAT,
 	FRAMWR	=>FRAMWR,
+	FRAM8WR	=>FRAM8WR,
 	
 	gclk		=>gclk,
-	cpuclk		=>CPU_clk,
+	CE3			=>vid_ce3,
+	cpuclk		=>rclk,
+	cpuce		=>cpuce_r,
 	clk			=>rclk,
-	rstn		=>CPU_rstn
+	rstn		=>CPU_rstnr,
+
+	VT24		=>VT24,
+	VT15		=>VT15,
+	CTYPE		=>CRTC_C,
+	SETL		=>CRTC_SETL,
+	SETR		=>CRTC_SETR,
+	SETV		=>CRTC_SETV,
+	SETOK		=>CRTC_SETOK,
+	TSET		=>CRTC_TSET
 	);
 
 	vidR8<=vidR3 & vidR3 & vidR3(2 downto 1);
 	vidG8<=vidG3 & vidG3 & vidG3(2 downto 1);
 	vidB8<=vidB3 & vidB3 & vidB3(2 downto 1);
 	
-	process(gclk,srstn)begin
+	process(rclk,srstn)begin
 		if(srstn='0')then
 			hdmiclk<='0';
-		elsif(gclk' event and gclk='1')then
+		elsif(rclk' event and rclk='1')then
+		 if(vid_ce3='1')then
 			hdmiclk<=not hdmiclk;
+		 end if;
 		end if;
 	end process;
 	
@@ -2170,25 +3287,55 @@ port map(
 	CRTC_CURC<=	CURC;
 	CRTC_CURE<=	CURE;
 	
+	-- The RTC finds the edges of STB and CCK on clk21m: bring both in first.
+	RTCSTBs	:cdc_sync2 port map(CSTB,CSTB21,clk21m);
+	RTCCKs	:cdc_sync2 port map(CCK,CCK21,clk21m);
 	U_RTC	:rtc4990MiSTer generic map(sysclk*1000,x"00") port map(
-		DCLK	=>CCK,
+		DCLK	=>CCK21,
 		DIN		=>C_DO,
-		DOUT	=>CDI,
+		DOUT	=>CDIo,
 		C		=>C_RTC,
 		CS		=>'1',
-		STB		=>not CSTB,
+		STB		=>not CSTB21,
 		OE		=>'1',
 
 		RTCIN	=>sysrtc,
 
 		sclk	=>clk21m,
-		rstn	=>srstn
+		rstn	=>srstn21
 	);
+	-- DOUT selects among clk21m registers and can glitch when the selection changes,
+	-- so register it on clk21m before it crosses to rclk.
+	process(clk21m)begin
+		if(clk21m' event and clk21m='1')then
+			CDIf<=CDIo;
+		end if;
+	end process;
+	CDIs	:cdc_sync2 port map(CDIf,CDI,rclk);
 
-	PCLKG	:unchchata port map(not pjoya(1),pclk,cpu_clk,srstn);
+	PCLKG	:unchchata port map(not pjoya(1),pclk,rclk,srstn,cpuce_r);
 	
-	TIMP600	:sftclk generic map(sysclk*1000,600,1) port map("0",RTI,clk21m,srstn);
+	TIMP600	:sftclk generic map(sysclk*1000,600,1) port map("0",RTI,clk21m,srstn21);
 	
+	-- The fill writes the sub CPU RAM through the same port while the sub CPU is in
+	-- reset (CPU_rstn waits for the fill).
+	SUBM_ADR<=ADDR_SUBRAM(RAMAWIDTH-1 downto 16) & "01" & FILL_SADR when FILL_SWR='1' else SUBADR;
+	SUBM_WDAT<=FILL_SWDAT when FILL_SWR='1' else SUBWDAT;
+	SUBM_WR<=FILL_SWR or SUBWR;
+	SUBM	:SUBMEM generic map(RAMAWIDTH) port map(
+		ADR		=>SUBM_ADR,
+		WR		=>SUBM_WR,
+		WDAT	=>SUBM_WDAT,
+		RDAT	=>SUBRDAT,
+
+		LDADR	=>LOADER_ADR(12 downto 0),
+		LDDAT	=>LOADER_WDAT,
+		LDWR	=>SUBROMWR,
+
+		clk		=>rclk
+	);
+	SUBWAIT<='0';
+
 	SUBU	:SUBunitsMiSTer generic map(SYSCLK,RAMCLK,RAMAWIDTH) port map(
 		RAMADR			=>SUBADR,
 		RAMRDAT			=>SUBRDAT,
@@ -2227,7 +3374,7 @@ port map(
 		mist_buffwr		=>mist_buffwr,
 		
 		FDE_ADDR		=>FDE_ADDR,
-		FDE_RD			=>FDE_RD,
+		FDE_RD			=>open,	--FDE reads follow the address in sdrbridge
 		FDE_WR			=>FDE_WR,
 		FDE_WDAT		=>FDE_WDAT,
 		FDE_RDAT		=>FDE_RDAT,
@@ -2246,11 +3393,13 @@ port map(
 		EMUBUSY			=>open,
 		FDCBUSY			=>pLed,
 		CPUCLK			=>SUBCLK,
+		CE_R			=>subce_r,
+		CE_F			=>subce_f,
 		clk21m			=>clk21m,
 		ramclk			=>rclk,
 		pclk			=>emuclk,
 		vclk			=>gclk,
-		srstn			=>srstn,
+		srstn			=>srstn21,
 		rstn			=>CPU_rstn
 	);
 
@@ -2260,15 +3409,17 @@ port map(
 		end if;
 	end process;
 	
+-- The mouse uses the strobe on clk21m: bring it in first.
+MSTBs	:cdc_sync2 port map(pStr,pStr21,clk21m);
 busmouse	:ps2mouse port map(
 	clk		=> clk21m,
 	reset	=> not CPU_rstn,
-	strobe	=> pStr,
+	strobe	=> pStr21,
 	data	=> mdata,
 	ps2_mouse	=> ps2_mouse
 );
 
-OPNS	:sftgen generic map(2) port map(2,OPNsft,clk21m,srstn);	--22.222/2=11.111MHz
+OPNS	:sftgen generic map(2) port map(2,OPNsft,clk21m,srstn21);	--22.222/2=11.111MHz
 
 process(clk21m) begin
 	if (clk21m' event and clk21m='1') then
@@ -2285,7 +3436,7 @@ end process;
 		PSG_CEn<=IORQ_n when CPUADR(7 downto 1)="0100010" else '1';		--0x44,45
 
 		FMS	:OPN generic map(16) port map(
-			DIN		=>CPUDAT,
+			DIN		=>CPUDAT_W,
 			DOUT	=>IDAT_PSG,
 			DOE		=>PSG_OE,
 			CSn		=>PSG_CEn,
@@ -2305,9 +3456,11 @@ end process;
 			PBOE	=>open,
 
 			clk		=>clk21m,
-			cpuclk	=>cpu_clk,
+			cpuclk	=>rclk,
 			sft		=>OPNsft,
-			rstn	=>CPU_rstn
+			rstn	=>CPU_rstn,
+			cpuce	=>cpuce_r,
+			rstnc	=>CPU_rstnr
 		);
 		
 		PCMADDR	<=(others=>'0');
@@ -2322,7 +3475,7 @@ end process;
 		PSG_CEn<=IORQ_n when CPUADR(7 downto 2)="010001" else '1';		--0x44,45,46,47
 	
 		FMS	:OPNA generic map(16) port map(
-			DIN		=>CPUDAT,
+			DIN		=>CPUDAT_W,
 			DOUT	=>IDAT_PSG,
 			DOE		=>PSG_OE,
 			CSn		=>PSG_CEn,
@@ -2351,9 +3504,11 @@ end process;
 			RAMWAIT	=>PCMRWAIT,
 
 			clk		=>clk21m,
-			cpuclk	=>cpu_clk,
+			cpuclk	=>rclk,
 			sft		=>OPNsft,
-			rstn	=>CPU_rstn
+			rstn	=>CPU_rstn,
+			cpuce	=>cpuce_r,
+			rstnc	=>CPU_rstnr
 		);
 		
 		sndmixL	:average generic map(16) port map(sndL,monosnd,snddatL);
@@ -2377,7 +3532,7 @@ end process;
 			rst		=>not CPU_rstn,
 			clk		=>clk21m,
 			cen		=>cen_opn,
-			din		=>CPUDAT,
+			din		=>CPUDAT_W,
 			addr	=>CPUADR(0),
 			cs_n	=>PSG_CEn,
 			wr_n	=>WR_n,
@@ -2432,7 +3587,7 @@ end process;
 			rst		=>not CPU_rstn,
 			clk		=>clk21m, 
 			cen		=>cen_opn,
-			din		=>CPUDAT,
+			din		=>CPUDAT_W,
 			addr	=>CPUADR(1 downto 0),
 			cs_n	=>PSG_CEn,
 			wr_n	=>WR_n,
@@ -2453,6 +3608,7 @@ end process;
 			adpcm_wr	=>PCMWR,
 			adpcm_din	=>PCMRDAT,
 			adpcm_dout	=>PCMWDAT,
+			adpcm_wait	=>PCMRWAIT,
 
 			fm_snd_right	=>sndFMR,
 			fm_snd_left		=>sndFML,
@@ -2471,23 +3627,15 @@ end process;
 			
 	end generate;
 	selDualFM	:if USE_OPN=5 generate
-		FM1_CEn<=IORQ_n	when CPUADR(7 downto 2)="010001" else '1';		--0x44,45,46,47
-		FM1_OE<='1' 	when CPUADR(7 downto 2)="010001" and IORQ_n='0' and RD_n='0' else '0';
-		FM2_CEn<=IORQ_n when CPUADR(7 downto 3)&CPUADR(1) ="101010" else '1';		--0xA8,A9,AC,AD
-		FM2_OE<='1'		when CPUADR(7 downto 3)&CPUADR(1) ="101010" and IORQ_n='0' and RD_n='0' else '0';
-		
-		SB1_CEn <= FM1_CEn	when (cSB2='0') else '1';
-		SB1_OE	<= FM1_OE	when (cSB2='0') else '0';
-		SB2_CEn <= FM2_CEn	when (cSB2='0') else FM1_CEn;
-		SB2_OE	<= FM2_OE	when (cSB2='0') else FM1_OE;
-		SB2_ADR <= CPUADR(2)&CPUADR(0) when (cSB2='0') else CPUADR(1 downto 0);
+		--The CPU reaches both chips through MP, which picks the chip and holds the address and data.
 		INTn_OPN<= INTn_SB1 when (cSB2='0') else INTn_SB2;
-		INTn_FM2<= INTn_SB2 when (cSB2='0') else '1';
+		INTn_FM2<= INTn_SB2 when (cSB2='0' and cSBN='0') else '1';
 
-		PSG_OE	<= SB1_OE or SB2_OE;
-		IDAT_PSG<= IDAT_SB1 when SB1_OE='1' else IDAT_SB2;
+		PSG_OE	<= '0';
+		IDAT_PSG<= (others=>'1');
 
-		FMDDS: DDS_OPN generic map(1248,3125) port map (
+		-- 7.9872MHz from clk21m = 425/21 MHz (20.238095MHz): 414/1049 is 0.16 ppm slow
+		FMDDS: DDS_OPN generic map(414,1049) port map (
 			rst		=>not srstna,
 			clk		=>clk21m,
 			enable	=>cen_opna
@@ -2509,10 +3657,10 @@ end process;
 			rst		=>not CPU_rstn,
 			clk		=>clk21m,
 			cen		=>cen_opn,
-			din		=>CPUDAT,
-			addr	=>CPUADR(0),
-			cs_n	=>SB1_CEn,
-			wr_n	=>WR_n,
+			din		=>FM_WDAT,
+			addr	=>SB1_ADR,
+			cs_n	=>SB1_WRn,
+			wr_n	=>SB1_WRn,
 
 			dout	=>IDAT_SB1,
 			irq_n	=>INTn_SB1,
@@ -2541,11 +3689,11 @@ end process;
 			rst		=>not CPU_rstn,
 			clk		=>clk21m, 
 			cen		=>cen_opna,
-			din		=>CPUDAT,
+			din		=>FM_WDAT,
 			addr	=>SB2_ADR,
 			cs_n	=>SB2_CEn,
-			wr_n	=>WR_n,
-			rd_n	=>RD_n,
+			wr_n	=>SB2_WRn,
+			rd_n	=>SB2_RDn,
 
 			dout	=>IDAT_SB2,
 			irq_n	=>INTn_SB2,
@@ -2562,6 +3710,7 @@ end process;
 			adpcm_wr	=>PCMWR,
 			adpcm_din	=>PCMRDAT,
 			adpcm_dout	=>PCMWDAT,
+			adpcm_wait	=>PCMRWAIT,
 
 			fm_snd_right	=>sndFMR,
 			fm_snd_left		=>sndFML,
@@ -2572,8 +3721,14 @@ end process;
 		sndPSG2(15 downto 14)<="00";
 		sndPSG2(1 downto 0)<="00";
 
-		sndL <= sndFM + sndFML + sndPSG + sndPSG2;
-		sndR <= sndFM + sndFMR + sndPSG + sndPSG2;
+		--Sum in 18 bits and saturate to 16 (the 16-bit sum wrapped around)
+		sndFMLb <= (others=>'0') when cSBN='1' else sndFML;
+		sndFMRb <= (others=>'0') when cSBN='1' else sndFMR;
+		sndPSG2b <= (others=>'0') when cSBN='1' else sndPSG2;
+		sndLw <= (sndFM(15)&sndFM(15)&sndFM) + (sndFMLb(15)&sndFMLb(15)&sndFMLb) + ("00"&sndPSG) + ("00"&sndPSG2b);
+		sndRw <= (sndFM(15)&sndFM(15)&sndFM) + (sndFMRb(15)&sndFMRb(15)&sndFMRb) + ("00"&sndPSG) + ("00"&sndPSG2b);
+		sndL <= x"7fff" when sndLw(17)='0' and sndLw(16 downto 15)/="00" else x"8000" when sndLw(17)='1' and sndLw(16 downto 15)/="11" else sndLw(15 downto 0);
+		sndR <= x"7fff" when sndRw(17)='0' and sndRw(16 downto 15)/="00" else x"8000" when sndRw(17)='1' and sndRw(16 downto 15)/="11" else sndRw(15 downto 0);
 
 		sndmixL	:average generic map(16) port map(sndL,BEEPsnd,snddatL);
 		sndmixR	:average generic map(16) port map(sndR,BEEPsnd,snddatR);
@@ -2585,26 +3740,64 @@ end process;
 	
 	beep	:beeposc generic map(2400,SYSCLK) port map(beepsig,clk21m,rstn);
 	
-	BEEPsnd<=	(others=>'0') when BEEPEN='0' else
-					x"4000"	when beepsig='1' else
-					x"c000";
+	sings	:singspk port map(sing,beepen,beepsig,BEEPsnd,clk21m,rstn);
 
 	pSndL<=snddatL;
 	pSndR<=snddatR;
 
-	COM_CSn<=IORQ_n when CPUADR(7 downto 1)="0010000" else '1';	--0x20,21
+	MP	:mainport port map(
+		IORQn	=>IORQ_n,
+		RDn		=>RD_n,
+		WRn		=>WR_n,
+		M1n		=>M1_n,
+		ADR		=>CPUADR(7 downto 0),
+		WDAT	=>CPUDAT_W,
+		RDAT	=>IDAT_SLOW,
+		OE		=>SLOW_OE,
+		WAITn	=>SLOW_WAITn,
+		FMSEL	=>MP_FMSEL,
+		SB2C	=>sb2c,
 
-	COM_vDIV<=conv_std_logic_vector(COM_DIV,11);
-	COMB	:clkdiv generic map(11) port map(COM_vDIV,COM_clk,clk21m,srstn);
+		cclk	=>rclk,
+		crstn	=>CPU_rstnr,
+
+		COM_CSn	=>COM_CSn,
+		COM_RDn	=>COM_RDn,
+		COM_WRn	=>COM_WRn,
+		COM_C_Dn=>COM_C_Dn,
+		COM_WDAT=>COM_WDAT,
+		COM_RDAT=>IDAT_COM,
+
+		FM_WDAT	=>FM_WDAT,
+		FM_CEN	=>cen_opna,
+		FM1_WRn	=>SB1_WRn,
+		FM1_ADR	=>SB1_ADR,
+		FM1_RDAT=>IDAT_SB1,
+		FM2_CSn	=>SB2_CEn,
+		FM2_WRn	=>SB2_WRn,
+		FM2_RDn	=>SB2_RDn,
+		FM2_ADR	=>SB2_ADR,
+		FM2_RDAT=>IDAT_SB2,
+
+		fclk	=>clk21m,
+		frstn	=>CPU_rstn
+	);
+
+	--A tape rate applies only under the x16 factor those rates are worked out for.
+	COM_vDIV<=	conv_std_logic_vector(CMT_DIV_600,11)  when cmt_clk_sel="01" and COM_MODE_BAUD="10" else
+				conv_std_logic_vector(CMT_DIV_1200,11) when cmt_clk_sel="10" and COM_MODE_BAUD="10" else
+				conv_std_logic_vector(COM_DIV,11);
+	COMB	:clkdiv generic map(11) port map(COM_vDIV,COM_clk,clk21m,srstn21);
+	cmt_mode<=COM_MODE_BAUD & COM_MODE_CLEN & COM_MODE_PEN & COM_MODE_PEV & COM_MODE_STOP;
 	
 	USART	:e8251 port map(
-		WRn		=>WR_n,
-		RDn		=>RD_n,
-		C_Dn	=>CPUADR(0),
+		WRn		=>COM_WRn,
+		RDn		=>COM_RDn,
+		C_Dn	=>COM_C_Dn,
 		CSn		=>COM_CSn,
-		DATIN	=>CPUDAT,
+		DATIN	=>COM_WDAT,
 		DATOUT	=>IDAT_COM,
-		DATOE	=>COM_OE,
+		DATOE	=>open,
 		
 		TXD		=>pCOM_TxD,
 		RxD		=>pCOM_RxD,
@@ -2618,6 +3811,12 @@ end process;
 		TxEMP	=>open,
 		RxRDY	=>INT_COMRX,
 		
+		MODE_BAUD	=>COM_MODE_BAUD,
+		MODE_CLEN	=>COM_MODE_CLEN,
+		MODE_PEN	=>COM_MODE_PEN,
+		MODE_PEV	=>COM_MODE_PEV,
+		MODE_STOP	=>COM_MODE_STOP,
+		
 		TxCn	=>COM_clk,
 		RxCn	=>COM_clk,
 		
@@ -2625,8 +3824,8 @@ end process;
 		rstn	=>CPU_rstn
 	);
 
-	process(clk21m,srstn)begin
-		if(srstn='0')then
+	process(clk21m,srstn21)begin
+		if(srstn21='0')then
 			TXTen<='1';
 			TenSW<='0';
 		elsif(clk21m' event and clk21m='1')then

@@ -74,6 +74,10 @@ port(
 	EMUBUSY			:out std_logic;
 	FDCBUSY			:out std_logic;
 	CPUCLK			:in std_logic;
+	-- High for one ramclk cycle where CPUCLK rises / falls. The sub CPU side
+	-- runs on ramclk and advances only on these cycles.
+	CE_R			:in std_logic;
+	CE_F			:in std_logic;
 	clk21m			:in std_logic;
 	ramclk			:in std_logic;
 	pclk			:in std_logic;
@@ -84,7 +88,7 @@ port(
 end SUBunitsMiSTer;
 
 architecture MAIN of SUBunitsMiSTer is
-component T80a
+component T80a_ce
     generic(
         Mode : integer := 0 -- 0 => Z80, 1 => Fast Z80, 2 => 8080, 3 => GB
     );
@@ -104,7 +108,14 @@ component T80a
         HALT_n      : out std_logic;
         BUSAK_n     : out std_logic;
         A           : out std_logic_vector(15 downto 0);
-        D           : inout std_logic_vector(7 downto 0)
+        D           : inout std_logic_vector(7 downto 0);
+        DOUT        : out std_logic_vector(7 downto 0);
+        CE_R        : in std_logic;
+        CE_F        : in std_logic;
+        M1T5        : out std_logic;
+        M1T6        : out std_logic;
+        MRD         : out std_logic;
+        MCYC        : out std_logic_vector(2 downto 0)
     );
 end component;
 
@@ -167,7 +178,8 @@ port(
 	bit0	:out std_logic;
 
 	clk		:in std_logic;
-	rstn	:in std_logic
+	rstn	:in std_logic;
+	ce		:in std_logic := '1'
 );
 end component;
 
@@ -210,7 +222,8 @@ port(
 	det		:out std_logic;
 
 	clk		:in std_logic;
-	rstn	:in std_logic
+	rstn	:in std_logic;
+	ce		:in std_logic := '1'
 );
 end component;
 
@@ -238,7 +251,8 @@ port(
 	PCLoe	:out std_logic;
 	
 	clk		:in std_logic;
-	rstn	:in std_logic
+	rstn	:in std_logic;
+	ce		:in std_logic := '1'
 );
 end component;
 
@@ -247,13 +261,15 @@ port(
 	IORQn	:in std_logic;
 	MREQn	:in std_logic;
 	RDn		:in std_logic;
+	WRn		:in std_logic;
 	M1n		:in std_logic;
 	DATOUT	:out std_logic_vector(7 downto 0);
 	DATOE	:out std_logic;
 
 	
 	cpuclk	:in std_logic;
-	rstn	:in std_logic
+	rstn	:in std_logic;
+	ce		:in std_logic := '1'
 );
 end component;
 
@@ -277,6 +293,10 @@ port(
 	
 	drv0int		:out integer range 0 to (BR_300_D*sysclk/1000000);
 	drv1int		:out integer range 0 to (BR_300_D*sysclk/1000000);
+	drv0f		:out integer range 0 to (BR_300_D*sysclk*16+31250)/62500;
+	drv0m		:out integer range 0 to (BR_300_D*sysclk*16+31250)/62500;
+	drv1f		:out integer range 0 to (BR_300_D*sysclk*16+31250)/62500;
+	drv1m		:out integer range 0 to (BR_300_D*sysclk*16+31250)/62500;
 	
 	hmssft		:out std_logic;
 	
@@ -289,9 +309,12 @@ component  FDCs
 generic(
 	maxtrack	:integer	:=85;
 	maxbwidth	:integer	:=88;
+	maxfwidth	:integer	:=88*256;
+	fracin		:boolean	:=false;
 	rdytout		:integer	:=800;
 	preseek		:std_logic	:='0';
-	sysclk		:integer	:=20
+	sysclk		:integer	:=20;
+	oneclk		:boolean	:=false
 );
 port(
 	RDn		:in std_logic;
@@ -305,6 +328,7 @@ port(
 	DRQ		:out std_logic;
 	TC		:in std_logic;
 	INTn	:out std_logic;
+	INTEV	:out std_logic;
 	WAITIN	:in std_logic	:='0';
 
 	WREN	:out std_logic;		--pin24
@@ -318,12 +342,21 @@ port(
 	side	:out std_logic;		--pin32
 	usel	:out std_logic_vector(1 downto 0);
 	READY	:in std_logic;		--pin34
-	TWOSIDE	:in std_logic;
+	readyv	:in std_logic_vector(3 downto 0);
+	TWOSIDE	:in std_logic_vector(3 downto 0);
 	
 	int0	:in integer range 0 to maxbwidth;
 	int1	:in integer range 0 to maxbwidth;
 	int2	:in integer range 0 to maxbwidth;
 	int3	:in integer range 0 to maxbwidth;
+	intf0	:in integer range 0 to maxfwidth	:=0;
+	intf1	:in integer range 0 to maxfwidth	:=0;
+	intf2	:in integer range 0 to maxfwidth	:=0;
+	intf3	:in integer range 0 to maxfwidth	:=0;
+	intm0	:in integer range 0 to maxfwidth	:=0;
+	intm1	:in integer range 0 to maxfwidth	:=0;
+	intm2	:in integer range 0 to maxfwidth	:=0;
+	intm3	:in integer range 0 to maxfwidth	:=0;
 	
 	td0		:in std_logic;
 	td1		:in std_logic;
@@ -339,7 +372,49 @@ port(
 	
 	sclk	:in std_logic;
 	fclk	:in std_logic;
-	rstn	:in std_logic
+	rstn	:in std_logic;
+	sce		:in std_logic := '1';
+	rstns	:in std_logic
+);
+end component;
+
+component cdc_sync2
+port(
+	d		:in std_logic;
+	q		:out std_logic;
+
+	clk		:in std_logic
+);
+end component;
+
+component fdcport
+port(
+	CSn		:in std_logic;
+	RDn		:in std_logic;
+	WRn		:in std_logic;
+	A0		:in std_logic;
+	WDAT	:in std_logic_vector(7 downto 0);
+	RDAT	:out std_logic_vector(7 downto 0);
+	DATOE	:out std_logic;
+	WAITn	:out std_logic;
+	INTn	:out std_logic;
+	TC		:in std_logic;
+
+	cclk	:in std_logic;
+	ce		:in std_logic;
+	crstn	:in std_logic;
+
+	fCSn	:out std_logic;
+	fRDn	:out std_logic;
+	fWRn	:out std_logic;
+	fA0		:out std_logic;
+	fWDAT	:out std_logic_vector(7 downto 0);
+	fRDAT	:in std_logic_vector(7 downto 0);
+	fTC		:out std_logic;
+	fINTEV	:in std_logic;
+
+	fclk	:in std_logic;
+	frstn	:in std_logic
 );
 end component;
 
@@ -574,9 +649,13 @@ port(
 end component;
 
 signal	CPUrstn	:std_logic;
+-- CPUrstn with its release synchronised to ramclk, for the logic on ramclk
+signal	CPUrstnrm	:std_logic;
+signal	CPUrstnr	:std_logic;
 signal	EMUINITDONEb	:std_logic;
 signal	IDAT	:std_logic_vector(7 downto 0);
 signal	CPUDAT	:std_logic_vector(7 downto 0);
+signal	CPUDAT_W	:std_logic_vector(7 downto 0);
 -- signal	IDAT_IO12	:std_logic_vector(7 downto 0);
 -- signal	IO12_OE		:std_logic;
 signal	IDAT_PPI	:std_logic_vector(7 downto 0);
@@ -593,8 +672,18 @@ signal	RDn			:std_logic;
 signal	WRn			:std_logic;
 signal	RAMCE		:std_logic;
 signal	INTn		:std_logic;
+signal	FDC_WAITn	:std_logic;
+signal	fFDC_CSn	:std_logic;
+signal	fFDC_RDn	:std_logic;
+signal	fFDC_WRn	:std_logic;
+signal	fFDC_A0		:std_logic;
+signal	fFDC_WDAT	:std_logic_vector(7 downto 0);
+signal	fFDC_RDAT	:std_logic_vector(7 downto 0);
+signal	fFDC_TC		:std_logic;
+signal	fFDC_INTEV	:std_logic;
 signal	TD1,TD0		:std_logic;
 signal	RV1,RV0		:std_logic;
+signal	RV1f,RV0f	:std_logic;
 signal	MON1,MON0	:std_logic;
 signal	TC			:std_logic;
 signal	FDC_CEn		:std_logic;
@@ -603,7 +692,7 @@ signal	FD_USEL		:std_logic_vector(1 downto 0);
 signal	FD_hmssft	:std_logic;
 signal	FD_int0		:integer range 0 to (BR_300_D*sysclk/1000000);
 signal	FD_int1		:integer range 0 to (BR_300_D*sysclk/1000000);
-signal	FDC_READYn	:std_logic;
+signal	FD_f0,FD_m0,FD_f1,FD_m1	:integer range 0 to (BR_300_D*sysclk*16+31250)/62500;
 signal	PPI_CSn		:std_logic;
 signal	PSEN		:std_logic;
 signal	FDC_BUSY	:std_logic;
@@ -611,6 +700,7 @@ signal	MONEN		:std_logic;
 -- signal	FDDEN		:std_logic;
 signal	EN1,EN0		:std_logic;
 signal	MON1S,MON0S	:std_logic;
+signal	MON1Sf,MON0Sf	:std_logic;
 
 signal	FDC_USELn	:std_logic_vector(3 downto 0);
 signal	FDC_MOTORn	:std_logic_vector(3 downto 0);
@@ -624,7 +714,10 @@ signal	FDC_INDEXn	:std_logic;
 signal	FDC_SIDEn	:std_logic;
 signal	FDC_WPROTn	:std_logic;
 signal	FDC_MFM		:std_logic;
-signal	FDC_TWOSIDE	:std_logic;
+signal	FDC_INDISK	:std_logic_vector(1 downto 0);
+signal	FDC_TS		:std_logic_vector(1 downto 0);
+constant SPINUP	:integer	:=sysclk*470;	--0.47 s, measured on a PC-8801MA
+signal	SPIN0,SPIN1	:integer range 0 to SPINUP;
 signal	FDC_READY	:std_logic;
 signal	FDE_EMUEN	:std_logic_vector(1 downto 0);
 signal	TDSEL		:std_logic;
@@ -644,11 +737,23 @@ signal	fde_cpyen	:std_logic;
 begin
 
 	CPUrstn<=rstn and EMUINITDONEb;
+
+	-- CPUrstn is released in the clk21m domain. Release it again on ramclk.
+	process(ramclk,CPUrstn)begin
+		if(CPUrstn='0')then
+			CPUrstnrm<='0';
+			CPUrstnr<='0';
+		elsif(ramclk' event and ramclk='1')then
+			CPUrstnrm<='1';
+			CPUrstnr<=CPUrstnrm;
+		end if;
+	end process;
+
 	mondat<=CPUDAT;
-	cpu:T80a generic map(0)port map(
-       RESET_n		=>CPUrstn,
-        CLK_n		=>CPUCLK,
-        WAIT_n		=>not RAMWAIT,
+	cpu:T80a_ce generic map(0)port map(
+       RESET_n		=>CPUrstnr,
+        CLK_n		=>ramclk,
+        WAIT_n		=>not RAMWAIT and FDC_WAITn,
         INT_n       =>INTn,
 --        INT_n       =>'1',
         NMI_n       =>'1',
@@ -662,7 +767,14 @@ begin
         HALT_n      =>open,
         BUSAK_n     =>open,
         A           =>ADR,
-        D           =>CPUDAT
+        D           =>CPUDAT,
+        DOUT        =>CPUDAT_W,
+        CE_R        =>CE_R,
+        CE_F        =>CE_F,
+        M1T5        =>open,
+        M1T6        =>open,
+        MRD         =>open,
+        MCYC        =>open
 	);
 
 	mmap	:mmapsub generic map(awidth) port map(
@@ -673,8 +785,8 @@ begin
 		RAM_ADR		=>RAMADR,
 		RAM_CE		=>RAMCE,
 		
-		clk			=>CPUCLK,
-		rstn		=>CPUrstn
+		clk			=>ramclk,
+		rstn		=>CPUrstnr
 	);
 	
 	CPUDAT<=	IDAT_INT	when INT_OE='1'  else
@@ -682,19 +794,25 @@ begin
 				-- IDAT_IO12	when IO12_OE='1' else
 				IDAT_PPI	when PPI_OE='1' else
 				IDAT_FDC	when FDC_OE='1'  else
+				--Nothing else answers an I/O read. The bus floats high, as on a real PC-8801FH.
+				(others=>'1') when IORQn='0' and RDn='0' else
 				(others=>'Z');
 	
-	RAMWDAT<=CPUDAT;
+	RAMWDAT<=CPUDAT_W;
 	RAMWR<=RAMCE and not WRn;
 	RAMRD<=RAMCE and not RDn;
 	
 --	IO12	:IO_RWS generic map(x"12") port map(ADR(7 downto 0),IORQn,RDn,WRn,CPUDAT,IDAT_IO12,IO12_OE,monout(7),monout(6),monout(5),monout(4),monout(3),monout(2),monout(1),monout(0),CPUCLK,CPUrstn);
-	IOf4	:IO_WRS generic map(x"f4") port map(ADR(7 downto 0),IORQn,WRn,CPUDAT,open,open,open,open,TD1,TD0,RV1,RV0,CPUCLK,CPUrstn);
-	IOf8	:IO_WRS generic map(x"f8") port map(ADR(7 downto 0),IORQn,WRn,CPUDAT,open,open,open,open,PSEN,open,MON1S,MON0S,CPUCLK,CPUrstn);
-	IOf8r	:IO_DETAC generic map(x"f8") port map(ADR(7 downto 0),IORQn,RDn,TC,CPUCLK,CPUrstn);
+	IOf4	:IO_WRS generic map(x"f4") port map(ADR(7 downto 0),IORQn,WRn,CPUDAT_W,open,open,open,open,TD1,TD0,RV1,RV0,ramclk,CPUrstnr,CE_R);
+	--The FDC and the disk emulation set the bit length from the density bits on clk21m.
+	--Bring each bit over on its own, so a change can't reach some of their registers a clock early.
+	RV0s	:cdc_sync2 port map(RV0,RV0f,clk21m);
+	RV1s	:cdc_sync2 port map(RV1,RV1f,clk21m);
+	IOf8	:IO_WRS generic map(x"f8") port map(ADR(7 downto 0),IORQn,WRn,CPUDAT_W,open,open,open,open,PSEN,open,MON1S,MON0S,ramclk,CPUrstnr,CE_R);
+	IOf8r	:IO_DETAC generic map(x"f8") port map(ADR(7 downto 0),IORQn,RDn,TC,ramclk,CPUrstnr,CE_R);
 	
 	TDSEL<=TD0 when FD_USEL="00" else TD1 when FD_USEL="01" else '0';
-	RVSEL<=RV0 when FD_USEL="00" else RV1 when FD_USEL="01" else '0';
+	RVSEL<=RV0f when FD_USEL="00" else RV1f when FD_USEL="01" else '0';
 	
 	FDC_MOTORn<="11" & not MON1 & not MON0;
 	FDC_CEn<='0' when IORQn='0' and ADR(7 downto 1)="1111101" else '1';
@@ -704,7 +822,7 @@ begin
 		RDn		=>RDn,
 		WRn		=>WRn,
 		ADR		=>ADR(1 downto 0),
-		DATIN	=>CPUDAT,
+		DATIN	=>CPUDAT_W,
 		DATOUT	=>IDAT_PPI,
 		DATOE	=>PPI_OE,
 		
@@ -721,11 +839,12 @@ begin
 		PCLo		=>SUBIO_PCLO,
 		PCLoe		=>open,
 		
-		clk		=>CPUCLK,
-		rstn	=>CPUrstn
+		clk		=>ramclk,
+		rstn	=>CPUrstnr,
+		ce		=>CE_R
 	);
 	
-	INTC	:INTSUB port map(IORQn,MREQn,RDn,M1n,IDAT_INT,INT_OE,CPUCLK,CPUrstn);
+	INTC	:INTSUB port map(IORQn,MREQn,RDn,WRn,M1n,IDAT_INT,INT_OE,ramclk,CPUrstnr,CE_R);
 	
 	FDT	:FDtiming generic map(sysclk) port map(
 		drv0sel		=>'0',
@@ -733,9 +852,9 @@ begin
 		drv0sele		=>'0',
 		drv1sele		=>'0',
 	
-		drv0hd		=>RV0,
+		drv0hd		=>RV0f,
 		drv0hdi		=>'1',		--IBM 1.44MB format
-		drv1hd		=>RV1,
+		drv1hd		=>RV1f,
 		drv1hdi		=>'1',		--IBM 1.44MB format
 		
 		--drv0hds		=>FD_HDS(0),
@@ -743,6 +862,10 @@ begin
 		
 		drv0int		=>FD_int0,
 		drv1int		=>FD_int1,
+		drv0f		=>FD_f0,
+		drv0m		=>FD_m0,
+		drv1f		=>FD_f1,
+		drv1m		=>FD_m1,
 		
 		hmssft		=>FD_hmssft,
 		
@@ -750,23 +873,57 @@ begin
 		rstn		=>CPUrstn
 	);
 	
+	--The FDC runs on clk21m only; fdcport carries the CPU's accesses over.
+	FDP	:fdcport port map(
+		CSn		=>FDC_CEn,
+		RDn		=>RDn,
+		WRn		=>WRn,
+		A0		=>ADR(0),
+		WDAT	=>CPUDAT_W,
+		RDAT	=>IDAT_FDC,
+		DATOE	=>FDC_OE,
+		WAITn	=>FDC_WAITn,
+		INTn	=>INTn,
+		TC		=>TC,
+
+		cclk	=>ramclk,
+		ce		=>CE_R,
+		crstn	=>CPUrstnr,
+
+		fCSn	=>fFDC_CSn,
+		fRDn	=>fFDC_RDn,
+		fWRn	=>fFDC_WRn,
+		fA0		=>fFDC_A0,
+		fWDAT	=>fFDC_WDAT,
+		fRDAT	=>fFDC_RDAT,
+		fTC		=>fFDC_TC,
+		fINTEV	=>fFDC_INTEV,
+
+		fclk	=>clk21m,
+		frstn	=>CPUrstn
+	);
+
 	FD	:FDCs generic map(
 	maxtrack	=>85,
 	maxbwidth	=>(BR_300_D*sysclk/1000000),
-	sysclk		=>sysclk/1000
+	maxfwidth	=>(BR_300_D*sysclk*16+31250)/62500,
+	fracin		=>true,
+	sysclk		=>sysclk/1000,
+	oneclk		=>true
 )
 port map(
-	RDn		=>RDn,
-	WRn		=>WRn,
-	CSn		=>FDC_CEn,
-	A0		=>ADR(0),
-	WDAT	=>CPUDAT,
-	RDAT	=>IDAT_FDC,
-	DATOE	=>FDC_OE,
+	RDn		=>fFDC_RDn,
+	WRn		=>fFDC_WRn,
+	CSn		=>fFDC_CSn,
+	A0		=>fFDC_A0,
+	WDAT	=>fFDC_WDAT,
+	RDAT	=>fFDC_RDAT,
+	DATOE	=>open,
 	DACKn	=>'1',
 	DRQ		=>open,
-	TC		=>TC,
-	INTn	=>INTn,
+	TC		=>fFDC_TC,
+	INTn	=>open,
+	INTEV	=>fFDC_INTEV,
 
 	WREN	=>FDC_WRENn,
 	WRBIT	=>FDC_WRBITn,
@@ -779,12 +936,21 @@ port map(
 	side	=>FDC_SIDEn,
 	usel	=>FD_USEL,
 	READY	=>FDC_READY,	-- The actual chip is active high, but here it's active low.
-	TWOSIDE	=>FDC_TWOSIDE,
+	readyv	=>"1100",
+	TWOSIDE	=>"00" & FDC_TS,
 	
 	int0	=>FD_int0,
 	int1	=>FD_int1,
 	int2	=>FD_int0,
 	int3	=>FD_int1,
+	intf0	=>FD_f0,
+	intf1	=>FD_f1,
+	intf2	=>FD_f0,
+	intf3	=>FD_f1,
+	intm0	=>FD_m0,
+	intm1	=>FD_m1,
+	intm2	=>FD_m0,
+	intm3	=>FD_m1,
 	
 	td0		=>TD0,
 	td1		=>TD1,
@@ -796,12 +962,13 @@ port map(
 	busy	=>FDC_BUSY,
 	mfm		=>FDC_MFM,
 	
-	sclk	=>CPUCLK,
+	sclk	=>clk21m,
 	fclk	=>clk21m,
-	rstn	=>CPUrstn
+	rstn	=>CPUrstn,
+	sce		=>'1',
+	rstns	=>CPUrstn
 );
 	FDC_READY<=		FD_USEL(1);
-	FDC_TWOSIDE<=	not FDC_READYn;
 
 	DSKE	:diskemu_mister generic map(
 		fclkfreq		=>sysclk,
@@ -823,7 +990,7 @@ port map(
 	--FDD
 		fdc_useln	=>FDC_USELn(1 downto 0),
 		fdc_motorn	=>FDC_MOTORn(1 downto 0),
-		fdc_readyn	=>FDC_READYn,
+		fdc_readyn	=>open,
 		fdc_wrenn	=>FDC_WRENn,
 		fdc_wrbitn	=>FDC_WRBITn,
 		fdc_rdbitn	=>FDC_RDBITn,
@@ -834,7 +1001,7 @@ port map(
 		fdc_siden	=>FDC_SIDEn,
 		fdc_wprotn	=>FDC_WPROTn,
 		fdc_eject	=>(others=>'0'),
-		fdc_indisk	=>open,
+		fdc_indisk	=>FDC_INDISK,
 		fdc_trackwid=>TDSEL,
 		fdc_dencity	=>RVSEL,
 		fdc_rpm		=>'0',
@@ -930,8 +1097,34 @@ port map(
 	EN0<='1' when FDC_BUSY='1' and FD_USEL="00" else '0';
 	EN1<='1' when FDC_BUSY='1' and FD_USEL="01" else '0';
 
-	MTS0 :MTsave generic map(sysclk,4000) port map(MON0S,EN0,'1',MON0,MTSAVEON,clk21m,rstn);
-	MTS1 :MTsave generic map(sysclk,4000) port map(MON1S,EN1,'1',MON1,MTSAVEON,clk21m,rstn);
+	--MTsave looks for the rising edge of the motor bits, so bring them to clk21m first.
+	MON0Ss	:cdc_sync2 port map(MON0S,MON0Sf,clk21m);
+	MON1Ss	:cdc_sync2 port map(MON1S,MON1Sf,clk21m);
+	--TS is the drive's READY line: a disk is in and its motor is up to speed. Use the motor bit
+	--the CPU wrote to F8h, not MTsave's output, which can stop the motor while the ROM thinks it
+	--runs. On a PC-8801MA, READY rises about 0.47 s after the motor starts and drops at once
+	--when it stops.
+	process(clk21m,rstn)begin
+		if(rstn='0')then
+			SPIN0<=SPINUP;
+			SPIN1<=SPINUP;
+		elsif(clk21m' event and clk21m='1')then
+			if(MON0Sf='0')then
+				SPIN0<=SPINUP;
+			elsif(SPIN0>0)then
+				SPIN0<=SPIN0-1;
+			end if;
+			if(MON1Sf='0')then
+				SPIN1<=SPINUP;
+			elsif(SPIN1>0)then
+				SPIN1<=SPIN1-1;
+			end if;
+		end if;
+	end process;
+	FDC_TS(0)<=FDC_INDISK(0) when MON0Sf='1' and SPIN0=0 else '0';
+	FDC_TS(1)<=FDC_INDISK(1) when MON1Sf='1' and SPIN1=0 else '0';
+	MTS0 :MTsave generic map(sysclk,4000) port map(MON0Sf,EN0,'1',MON0,MTSAVEON,clk21m,rstn);
+	MTS1 :MTsave generic map(sysclk,4000) port map(MON1Sf,EN1,'1',MON1,MTSAVEON,clk21m,rstn);
 
 	process(clk21m)begin
 		if(clk21m' event and clk21m='1')then

@@ -12,11 +12,13 @@ generic(
 );
 port(
 	TRAMADR	:out std_logic_vector(11 downto 0);
-	TRAMDAT	:in std_logic_vector(7 downto 0);
+	TRAMDAT	:in std_logic_vector(8 downto 0);	-- bit 8 of an attribute: over line
 	
 	FRAMADR	:out std_logic_vector(11 downto 0);
 	FRAMDAT0:in std_logic_vector( 7 downto 0);
 	FRAMDAT1:in std_logic_vector( 7 downto 0);
+	FRAMADR8:out std_logic_vector(10 downto 0);	-- 8x8 font
+	FRAMDAT8:in std_logic_vector( 7 downto 0);
 	
 	BITOUT	:out std_logic;
 	FGCOLOR	:out std_logic_vector(2 downto 0);
@@ -33,13 +35,21 @@ port(
 	VMODE	:in std_logic;
 	
 	UCOUNT	:in integer range 0 to DOTPU-1;
-	HUCOUNT	:in integer range 0 to (HWIDTH/DOTPU)-1;
-	VCOUNT	:in integer range 0 to VWIDTH-1;
+	HUCOUNT	:in integer range 0 to HUWMAX-1;
+	VCOUNT	:in integer range 0 to VWMAX-1;
 	HCOMP	:in std_logic;
 	VCOMP	:in std_logic;
 
 	clk		:in std_logic;
-	rstn	:in std_logic
+	rstn	:in std_logic;
+	ce		:in std_logic := '1';
+
+	CURVMODE	:out std_logic;	-- VMODE taken at VCOMP: the row height being drawn
+
+	VT24	:in std_logic	:='0';		-- 1:24kHz or 15kHz timing (lines from the CRTC)
+	VT15	:in std_logic	:='0';		-- 1:15kHz timing
+	VRET24	:in integer range 0 to VWMAX-1	:=VRETMIN24;	-- retrace lines in 24kHz or 15kHz timing
+	CHRL24	:in integer range CHRLMIN24 to CHRLMAX24	:=CHRLDEF24	-- character height in 24kHz or 15kHz timing
 );
 end TEXTSCR2;
 
@@ -57,6 +67,16 @@ signal	DHCOMP	:std_logic;
 signal	DVCOMP	:std_logic;
 signal	C_LOW	:integer range 0 to 31;
 signal	C_LIN	:integer range 0 to 19;
+signal	C_LIN31	:integer range 0 to 19;
+signal	LIN31Q	:std_logic_vector(9 downto 0);	-- VCOUNT-VIV, used from VIV on
+type	MOD5_T is array(0 to 30) of integer range 0 to 4;
+constant	MOD5	:MOD5_T:=(0,1,2,3,4,0,1,2,3,4,0,1,2,3,4,0,1,2,3,4,0,1,2,3,4,0,1,2,3,4,0);
+signal	C_LIN24	:integer range 0 to 19;
+signal	C_LIN2	:integer range 0 to 38;	-- C_LIN in the lines of a 16-line glyph
+signal	LBASE	:integer range 0 to VWMAX-1;	-- 24kHz: first line of the row being drawn
+signal	LDIFF	:integer range -VWMAX to VWMAX;
+signal	vivs	:integer range 0 to VWMAX-1;
+signal	hivs	:integer range 0 to HUWMAX-1;
 signal	C_COL	:integer range 0 to 127;
 signal	iCURL	:integer range 0 to 31;
 signal	iCURC	:integer range 0 to 127;
@@ -66,6 +86,7 @@ signal	CICOUNT	:integer range 0 to CBLINKINT-1;
 signal	BLKF	:std_logic;
 signal	BICOUNT	:integer range 0 to BLINKINT-1;
 signal	CHRLINES	:integer range 0 to 20;
+signal	CHRL31	:integer range 16 to 20;
 signal	VMODEC	:std_logic;
 signal	HMODEC	:std_logic;
 
@@ -78,7 +99,8 @@ port(
 	q		:out std_logic;
 	
 	clk		:in std_logic;
-	rstn	:in std_logic
+	rstn	:in std_logic;
+	ce		:in std_logic := '1'
 );
 end component;
 
@@ -87,17 +109,53 @@ begin
 	iCURL<=conv_integer(CURL);
 	iCURC<=conv_integer(CURC);
 
-	Hdelay	:delayer generic map(1) port map(HCOMP,DHCOMP,clk,rstn);
-	Vdelay	:delayer generic map(2) port map(VCOMP,DVCOMP,clk,rstn);
+	Hdelay	:delayer generic map(1) port map(HCOMP,DHCOMP,clk,rstn,ce);
+	Vdelay	:delayer generic map(2) port map(VCOMP,DVCOMP,clk,rstn,ce);
 
-	C_LIN<=0 when VCOUNT<VIV else (VCOUNT-VIV)mod CHRLINES;
-	C_COL<=0 when HUCOUNT<HIV else HUCOUNT-HIV;
+	vivs<=VRET24 when VT24='1' else VIV;
+	hivs<=HIV15 when VT15='1' else HIV24 when VT24='1' else HIV;
+
+	--no divider: a divider does not fit in a clock. Mod 20 is 4*((q/4) mod 5) + q mod 4,
+	--and (q/4) mod 5 is the sum of its two nibbles mod 5, as 16 mod 5 = 1.
+	LIN31Q<=conv_std_logic_vector(VCOUNT-VIV,10);
+	C_LIN31<=0 when VCOUNT<VIV else
+			conv_integer(LIN31Q(3 downto 0)) when VMODEC='1' else
+			MOD5(conv_integer(LIN31Q(9 downto 6))+conv_integer(LIN31Q(5 downto 2)))*4+conv_integer(LIN31Q(1 downto 0));
+	--24kHz: the character height is not fixed, so count from the first line of the row
+	LDIFF<=VCOUNT-LBASE;
+	C_LIN24<=0 when VCOUNT<vivs or LDIFF<0 else
+			LDIFF when LDIFF<CHRLINES else
+			LDIFF-CHRLINES when LDIFF<CHRLINES*2 else
+			0;
+	C_LIN<=C_LIN24 when VT24='1' else C_LIN31;
+	--15kHz draws a glyph line once, 24kHz and 31kHz twice. The 8x8 font and the
+	--graphic characters (4 lines a cell in 16) are read at C_LIN2, and lines from
+	--16 on (the bottom of a 20-line row) are blank.
+	C_LIN2<=C_LIN*2 when VT15='1' else C_LIN;
+	C_COL<=0 when HUCOUNT<hivs else HUCOUNT-hivs;
+
+	process(clk,rstn)begin
+		if(rstn='0')then
+			LBASE<=0;
+		elsif(clk' event and clk='1')then
+		 if(ce='1')then
+			if(VCOUNT<vivs)then
+				LBASE<=vivs;
+			elsif(LDIFF<0 or LDIFF>=CHRLINES*2)then
+				LBASE<=VCOUNT;	-- after reset the count starts inside the display
+			elsif(LDIFF>=CHRLINES)then
+				LBASE<=LBASE+CHRLINES;
+			end if;
+		 end if;
+		end if;
+	end process;
 
 	process(clk,rstn)begin
 		if(rstn='0')then
 			CURF<='1';
 			CICOUNT<=CBLINKINT-1;
 		elsif(clk' event and clk='1')then
+		 if(ce='1')then
 			if(VCOMP='1')then
 				if(CICOUNT=0)then
 					CURF<=not CURF;
@@ -106,6 +164,7 @@ begin
 					CICOUNT<=CICOUNT-1;
 				end if;
 			end if;
+		 end if;
 		end if;
 	end process;
 
@@ -114,6 +173,7 @@ begin
 			BLKF<='0';
 			BICOUNT<=BLINKINT-1;
 		elsif(clk' event and clk='1')then
+		 if(ce='1')then
 			if(VCOMP='1')then
 				if(BICOUNT=0)then
 					BLKF<=not BLKF;
@@ -122,6 +182,7 @@ begin
 					BICOUNT<=BICOUNT-1;
 				end if;
 			end if;
+		 end if;
 		end if;
 	end process;
 
@@ -132,14 +193,18 @@ begin
 			HMODEC<='0';
 			VMODEC<='0';
 		elsif(clk' event and clk='1')then
+		 if(ce='1')then
 			if(VCOMP='1')then
 				HMODEC<=HMODE;
 				VMODEC<=VMODE;
 			end if;
+		 end if;
 		end if;
 	end process;
 
-	CHRLINES<=16 when VMODEC='1' else 20;
+	CHRL31<=16 when VMODEC='1' else 20;
+	CHRLINES<=CHRL24 when VT24='1' else CHRL31;
+	CURVMODE<=VMODEC;
 
 	process (clk,rstn)
 	variable BNXTDOT0	:std_logic_vector(7 downto 0);
@@ -154,12 +219,14 @@ begin
 			NXTBL<='0';
 			TRAMADRb<=(others=>'0');
 			FRAMADR<=(others=>'0');
+			FRAMADR8<=(others=>'0');
 			C_LOW<=0;
 		elsif(clk' event and clk='1')then
+		 if(ce='1')then
 
 -- Data	section
 			if(DHCOMP='1')then
-				if(VCOUNT>VIV)then
+				if(VCOUNT>vivs)then
 					if(C_LIN/=0)then
 						TRAMADRb<=TRAMADRb-(HUVIS*2);
 					else
@@ -173,34 +240,43 @@ begin
 			end if;
 			
 			if(UCOUNT=4)then
-					FRAMADR(11 downto 4)<=TRAMDAT;
-				if(C_LIN<16)then
-					FRAMADR(3 downto 0)<=conv_std_logic_vector(C_LIN,4);
+					FRAMADR(11 downto 4)<=TRAMDAT(7 downto 0);
+					FRAMADR8(10 downto 3)<=TRAMDAT(7 downto 0);
+				if(C_LIN2<16)then
+					FRAMADR(3 downto 0)<=conv_std_logic_vector(C_LIN2,4);
+					FRAMADR8(2 downto 0)<=conv_std_logic_vector(C_LIN2/2,3);
 				else
 					FRAMADR(3 downto 0)<=(others=>'0');
+					FRAMADR8(2 downto 0)<=(others=>'0');
 				end if;
-				if(VCOUNT>=VIV and HUCOUNT>=HIV)then
+				if(VCOUNT>=vivs and HUCOUNT>=hivs)then
 					TRAMADRb<=TRAMADRb+1;
 				end if;
 			elsif(UCOUNT=6)then
-				if(VCOUNT>=VIV and HUCOUNT>=HIV)then
+				if(VCOUNT>=vivs and HUCOUNT>=hivs)then
 					if((TRAMDAT(3)='1' and BLKF='1') or (TRAMDAT(5)='1'))then
 						BNXTDOT0:=(others=>'0');
 						BNXTDOT1:=(others=>'0');
 					else
-						if(C_LIN<16)then
-							BNXTDOT0:=FRAMDAT0;
+						if(C_LIN2<16)then
+							BNXTDOT0:=FRAMDAT8;
 							BNXTDOT1:=FRAMDAT1;
 						else
 							BNXTDOT0:=(others=>'0');
 							BNXTDOT1:=(others=>'0');
 						end if;
 					end if;
-					if(TRAMDAT(6)='1' and C_LIN=15)then	-- under line
+					--24kHz, 15kHz: the under line is the last line of the row, the over line
+					--the first, and the cursor the whole row or its last line.
+					if(TRAMDAT(6)='1' and ((VT24='0' and C_LIN=15) or (VT24='1' and C_LIN=CHRLINES-1)))then	-- under line
 						BNXTDOT0:=(others=>'1');
 						BNXTDOT1:=(others=>'1');
 					end if;
-					if(CURV='1' and C_LOW=iCURL and C_COL=iCURC and (CURM='1' or C_LIN>(CHRLINES-CURLINE-1)))then
+					if(VT24='1' and TRAMDAT(8)='1' and C_LIN=0)then	-- over line
+						BNXTDOT0:=(others=>'1');
+						BNXTDOT1:=(others=>'1');
+					end if;
+					if(CURV='1' and C_LOW=iCURL and C_COL=iCURC and (CURM='1' or (VT24='0' and C_LIN>(CHRLINES-CURLINE-1)) or (VT24='1' and C_LIN=CHRLINES-1)))then
 						NXTDOT0<=not BNXTDOT0;
 						NXTDOT1<=not BNXTDOT1;
 					else
@@ -221,6 +297,7 @@ begin
 					NXTFS<='0';
 				end if;
 			end if;
+		 end if;
 		end if;
 	end process;
 
@@ -235,6 +312,7 @@ begin
 			BLINK<='0';
 			CURDOT<=(others=>'0');
 		elsif(clk' event and clk='1')then
+		 if(ce='1')then
 			if(HMODEC='1')then
 				if(UCOUNT=0)then
 					if(NXTFS='0')then
@@ -268,6 +346,7 @@ begin
 					CURDOT<=CURDOT(6 downto 0) & '0';
 				end if;
 			end if;
+		 end if;
 		end if;
 	end process;
 

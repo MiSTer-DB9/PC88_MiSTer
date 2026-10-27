@@ -57,7 +57,8 @@ parameter YM2203_LUMPED=0; // set to 1 if all PSG outputs are shorted together w
 
 jt12_top #(
     .use_lfo(0),.use_ssg(1), .num_ch(3), .use_pcm(0), .use_adpcm(0), .mask_div(0),
-    .JT49_COMP(3'd0),.YM2203_LUMPED(YM2203_LUMPED) )
+    .JT49_COMP(3'd0),.YM2203_LUMPED(YM2203_LUMPED),
+    .busy_len(18), .read_bus(1) )
 u_jt12(
     .rst            ( rst          ),        // rst should be at least 6 clk&cen cycles long
     .clk            ( clk          ),        // CPU clock
@@ -86,6 +87,7 @@ u_jt12(
     .adpcmb_data    ( 8'd0         ),
     .adpcmb_addr    (              ), // real hardware has 12 pins multiplexed through PMPX pin
     .adpcmb_roe_n   (              ), // ADPCM-B ROM output enable
+    .adpcmb_wait    ( 1'b0         ),
     // Separated output
     .psg_A          ( psg_A        ),
     .psg_B          ( psg_B        ),

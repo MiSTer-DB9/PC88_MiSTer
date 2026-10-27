@@ -9,9 +9,12 @@ entity FDCs is
 generic(
 	maxtrack	:integer	:=85;
 	maxbwidth	:integer	:=88;
+	maxfwidth	:integer	:=88*256;	--bit cells in 1/256 clocks
+	fracin		:boolean	:=false;	--true: intf*/intm* time the writes; false: int* as before
 	rdytout		:integer	:=800;
 	preseek		:std_logic	:='0';
-	sysclk		:integer	:=20
+	sysclk		:integer	:=20;
+	oneclk		:boolean	:=false		--sclk is fclk and sce is '1'
 );
 port(
 	RDn		:in std_logic;
@@ -25,6 +28,7 @@ port(
 	DRQ		:out std_logic;
 	TC		:in std_logic;
 	INTn	:out std_logic;
+	INTEV	:out std_logic;		--the events that set INTn, one sclk wide (for fdcport with oneclk)
 	WAITIN	:in std_logic	:='0';
 
 	WREN	:out std_logic;		--pin24
@@ -38,12 +42,23 @@ port(
 	side	:out std_logic;		--pin32
 	usel	:out std_logic_vector(1 downto 0);
 	READY	:in std_logic;		--pin34
-	TWOSIDE	:in std_logic;
+	-- '1' when the drive is not ready, one bit per drive
+	readyv	:in std_logic_vector(3 downto 0);
+	TWOSIDE	:in std_logic_vector(3 downto 0);	--a disk is in the drive
 	
 	int0	:in integer range 0 to maxbwidth;
 	int1	:in integer range 0 to maxbwidth;
 	int2	:in integer range 0 to maxbwidth;
 	int3	:in integer range 0 to maxbwidth;
+	--the same bit cells in 1/256 clocks, for FM and for MFM: they time the writes
+	intf0	:in integer range 0 to maxfwidth	:=0;
+	intf1	:in integer range 0 to maxfwidth	:=0;
+	intf2	:in integer range 0 to maxfwidth	:=0;
+	intf3	:in integer range 0 to maxfwidth	:=0;
+	intm0	:in integer range 0 to maxfwidth	:=0;
+	intm1	:in integer range 0 to maxfwidth	:=0;
+	intm2	:in integer range 0 to maxfwidth	:=0;
+	intm3	:in integer range 0 to maxfwidth	:=0;
 	
 	td0		:in std_logic;
 	td1		:in std_logic;
@@ -59,7 +74,9 @@ port(
 	
 	sclk	:in std_logic;
 	fclk	:in std_logic;
-	rstn	:in std_logic
+	rstn	:in std_logic;
+	sce		:in std_logic := '1';	-- enable for the sclk side
+	rstns	:in std_logic			-- reset for the sclk side, released on sclk
 );
 end FDCs;
 
@@ -140,10 +157,27 @@ signal	sDIOd	:std_logic;
 signal	sideb	:std_logic;
 signal	uselb	:std_logic_vector(1 downto 0);
 signal	DxBclr	:std_logic;
+signal	SISUS	:std_logic_vector(1 downto 0);
+signal	DxBclrd	:std_logic;
 signal	SEclr	:std_logic;
 -- signal	iSE		:std_logic;
-signal	SISen	:std_logic;
 signal	SISclr	:std_logic;
+-- seek completions waiting to be reported
+type	seekq_t	is array(0 to 3) of std_logic_vector(1 downto 0);
+signal	sqdrv	:seekq_t;						-- drive numbers of completed seeks, oldest first
+signal	sqerr	:std_logic_vector(3 downto 0);	-- whether that completion was an error
+signal	sqnr	:std_logic_vector(3 downto 0);	-- NR taken at completion time
+signal	sqcnt	:integer range 0 to 4;			-- number of entries queued
+-- SENSE INTERRUPT STATUS result, held per drive
+type	sisq_t	is array(0 to 3) of std_logic_vector(7 downto 0);
+signal	sisst0	:sisq_t;						-- per-drive ST0, untouched by commands
+signal	sispcn	:sisq_t;						-- per-drive PCN, untouched by commands
+signal	sisvld	:std_logic_vector(3 downto 0);	-- per-drive pending flag
+signal	SISclrd	:std_logic;						-- SISclr edge, sclk width seen on fclk
+signal	sisdrv	:std_logic_vector(1 downto 0);	-- drive to report next, lowest number first
+signal	sisany	:std_logic;						-- any drive has a pending result
+signal	sisPCNl	:std_logic_vector(7 downto 0);	-- PCN latched with the first result byte
+signal	sCBq	:std_logic_vector(1 downto 0);
 
 signal	IOWR_DAT	:std_logic;
 signal	IORD_DAT	:std_logic;
@@ -180,7 +214,6 @@ signal	RDDAT_CMD	:std_logic_vector(7 downto 0);
 signal	DETSECT		:std_logic;
 signal	COMPDAT		:std_logic_vector(7 downto 0);
 signal	scancomp	:std_logic;
-signal	sREADY		:std_logic;
 
 type execstate_t is (
 		es_idle,
@@ -363,7 +396,7 @@ signal	incRs		:std_logic;
 signal	resRs		:std_logic;
 signal	setNs		:std_logic;
 signal	bitwidth	:integer range 0 to maxbwidth*2;
-signal	sftwidth	:integer range 0 to maxbwidth*2;
+signal	sftwidth	:integer range 0 to maxfwidth;
 signal	setHD		:std_logic;
 signal	resHD		:std_logic;
 signal	setHDs	:std_logic;
@@ -589,9 +622,9 @@ port(
 );
 end component;
 
-component sftgen
+component sftfrac
 generic(
-	maxlen	:integer	:=100
+	maxlen	:integer	:=100*256
 );
 port(
 	len		:in integer range 0 to maxlen;
@@ -642,18 +675,24 @@ component DIGIFILTER
 		Q	:out std_logic;
 
 		clk	:in std_logic;
-		rstn :in std_logic
+		rstn :in std_logic;
+		ce	:in std_logic := '1'
 	);
 end component;
 
 component clktx is
+generic(
+	same	:boolean	:=false
+);
 port(
 	txin	:in std_logic;
 	txout	:out std_logic;
 	
 	fclk	:in std_logic;
 	sclk	:in std_logic;
-	rstn	:in std_logic
+	rstn	:in std_logic;
+	ce		:in std_logic := '1';
+	rstns	:in std_logic
 );
 end component;
 begin
@@ -661,12 +700,13 @@ begin
 	IOWR_DAT<='1' when CSn='0' and A0='1' and WRn='0' else '0';
 	IORD_DAT<='1' when CSn='0' and A0='1' and RDn='0' else '0';
 	IORD_STA<='1' when CSn='0' and A0='0' and RDn='0' else '0';
+
 	DMAWR<='1' when DACKn='0' and WRn='0' else '0';
 	DMARD<='1' when DACKn='0' and RDn='0' else '0';
 	
 	ixflt	:DIGIFILTER generic map(1,'1') port map(index,indexb,fclk,rstn);
 	t0flt	:DIGIFILTER generic map(1,'1') port map(track0,track0b,fclk,rstn);
-	t0flts:DIGIFILTER generic map(1,'1') port map(track0,track0s,sclk,rstn);
+	t0flts:DIGIFILTER generic map(1,'1') port map(track0,track0s,sclk,rstns,sce);
 --	process(clk,rstn)begin
 --		if(rstn='0')then
 --			indexb<='0';
@@ -675,11 +715,11 @@ begin
 --		end if;
 --	end process;
 	
-	DMARQtx	:clktx port map(DMARQ,DMARQs,fclk,sclk,rstn);
+	DMARQtx	:clktx generic map(oneclk) port map(DMARQ,DMARQs,fclk,sclk,rstn,sce,rstns);
 
-	process(sclk,rstn)
+	process(sclk,rstns)
 	begin
-		if(rstn='0')then
+		if(rstns='0')then
 			lIOWR_DAT<='0';
 			lIORD_DAT<='0';
 			-- lIORD_STA<='0';
@@ -690,6 +730,7 @@ begin
 			-- CPURD_STA<='0';
 			DRQ<='0';
 		elsif(sclk' event and sclk='1')then
+		 if(sce='1')then
 			CPUWR_DAT<='0';
 			CPURD_DAT<='0';
 			-- CPURD_STA<='0';
@@ -725,25 +766,26 @@ begin
 			lDMAWR<=DMAWR;
 			lDMARD<=DMARD;
 --			lWDAT<=WDAT;
+		 end if;
 		end if;
 	end process;
 	
 	DATOE<='1' when IORD_DAT='1' or IORD_STA='1' or DMARD='1' else '0';
 	
-	setCtx	:clktx port map(setC,setCs,fclk,sclk,rstn);
-	incCtx	:clktx port map(incC,incCs,fclk,sclk,rstn);
-	resHtx	:clktx port map(resH,resHs,fclk,sclk,rstn);
-	setHtx	:clktx port map(setH,setHs,fclk,sclk,rstn);
-	setRtx	:clktx port map(setR,setRs,fclk,sclk,rstn);
-	incRtx	:clktx port map(incR,incRs,fclk,sclk,rstn);
-	resRtx	:clktx port map(resR,resRs,fclk,sclk,rstn);
-	setNtx	:clktx port map(setN,setNs,fclk,sclk,rstn);
-	setHDtx	:clktx port map(setHD,setHDs,fclk,sclk,rstn);
-	resHDtx	:clktx port map(resHD,resHDs,fclk,sclk,rstn);
-	endEXECtx	:clktx port map(end_EXEC,end_EXECs,fclk,sclk,rstn);
+	setCtx	:clktx generic map(oneclk) port map(setC,setCs,fclk,sclk,rstn,sce,rstns);
+	incCtx	:clktx generic map(oneclk) port map(incC,incCs,fclk,sclk,rstn,sce,rstns);
+	resHtx	:clktx generic map(oneclk) port map(resH,resHs,fclk,sclk,rstn,sce,rstns);
+	setHtx	:clktx generic map(oneclk) port map(setH,setHs,fclk,sclk,rstn,sce,rstns);
+	setRtx	:clktx generic map(oneclk) port map(setR,setRs,fclk,sclk,rstn,sce,rstns);
+	incRtx	:clktx generic map(oneclk) port map(incR,incRs,fclk,sclk,rstn,sce,rstns);
+	resRtx	:clktx generic map(oneclk) port map(resR,resRs,fclk,sclk,rstn,sce,rstns);
+	setNtx	:clktx generic map(oneclk) port map(setN,setNs,fclk,sclk,rstn,sce,rstns);
+	setHDtx	:clktx generic map(oneclk) port map(setHD,setHDs,fclk,sclk,rstn,sce,rstns);
+	resHDtx	:clktx generic map(oneclk) port map(resHD,resHDs,fclk,sclk,rstn,sce,rstns);
+	endEXECtx	:clktx generic map(oneclk) port map(end_EXEC,end_EXECs,fclk,sclk,rstn,sce,rstns);
 	
-	process(sclk,rstn)begin
-		if(rstn='0')then
+	process(sclk,rstns)begin
+		if(rstns='0')then
 			command	<=(others=>'0');
 			C		<=(others=>'0');
 			D		<=(others=>'0');
@@ -772,9 +814,11 @@ begin
 			RDDAT_CMD<=(others=>'0');
 			sDIOc	<='0';
 			DxBclr	<='0';
+			SISUS	<="00";
 			SEclr	<='0';
 			SISclr	<='0';
 		elsif(sclk' event and sclk='1')then 
+		 if(sce='1')then
 			EXEC<='0';
 			DxBclr	<='0';
 			SEclr	<='0';
@@ -1119,8 +1163,11 @@ begin
 					when 1 =>
 						RD_CMD<='1';
 						sDIOc<='1';
-						if(SISen='1')then
-							RDDAT_CMD<=(ST0 and x"FB");
+						-- report the lowest-numbered drive that has a pending result
+						if(sisany='1')then
+							RDDAT_CMD<=(sisst0(conv_integer(sisdrv)) and x"FB");
+							sisPCNl<=sispcn(conv_integer(sisdrv));
+							SISUS<=sisdrv;
 							SEclr<='1';
 							datnum<=datnum+1;
 						else
@@ -1129,7 +1176,7 @@ begin
 						end if;
 					when 2=>
 						if(CPURD_DAT='1')then
-							RDDAT_CMD<=PCN;
+							RDDAT_CMD<=sisPCNl;
 							datnum<=datnum+1;
 						end if;
 					when 3 =>
@@ -1232,6 +1279,7 @@ begin
 					end case;
 				end case;
 			end if;
+		 end if;
 		end if;
 	end process;
 	
@@ -1282,7 +1330,16 @@ begin
 		end if;
 	end process;
 	
-	process(fclk,rstn)begin
+	process(fclk,rstn)
+		variable	seekpush	:std_logic;
+		variable	pushdrv		:integer range 0 to 3;
+		variable	pusherr		:std_logic;
+		variable	dopop		:std_logic;
+		variable	qn			:integer range 0 to 4;
+		variable	visv		:std_logic_vector(3 downto 0);
+		variable	vd			:integer range 0 to 3;
+		variable	lastsect	:std_logic;
+	begin
 		if(rstn='0')then
 			execstate<=es_idle;
 			end_EXEC<='0';
@@ -1316,6 +1373,7 @@ begin
 			setHD<='0';
 			resHD<='0';
 			sIC<="00";
+			sUS<="00";
 			sNR<='0';
 			sOR<='0';
 			sND<='0';
@@ -1345,6 +1403,15 @@ begin
 			ecommand<=(others=>'0');
 			COMPDAT<=(others=>'0');
 			scancomp<='0';
+			sqdrv<=(others=>"00");
+			sqerr<=(others=>'0');
+			sqnr<=(others=>'0');
+			sqcnt<=0;
+			sisst0<=(others=>(others=>'0'));
+			sispcn<=(others=>(others=>'0'));
+			sisvld<=(others=>'0');
+			SISclrd<='0';
+			sCBq<="11";
 		elsif(fclk' event and fclk='1')then
 			end_EXEC<='0';
 			seek_bgn<='0';
@@ -1377,60 +1444,92 @@ begin
 			setHD<='0';
 			resHD<='0';
 			NRDSTART<='0';
+			sCBq <= sCBq(0) & sCB;
+			-- queue seek completions, also while a transfer is running
+			seekpush := '0';
+			pushdrv  := 0;
+			pusherr  := '0';
+			for i in 0 to 3 loop
+				if(seek_end(i)='1')then
+					seekpush := '1';
+					pushdrv  := i;
+					pusherr  := '0';
+				elsif(seek_err(i)='1')then
+					seekpush := '1';
+					pushdrv  := i;
+					pusherr  := '1';
+				end if;
+			end loop;
+
+			dopop := '0';
+			-- in the command phase, move the oldest completion into its drive's result
+			if(execstate=es_idle and sCB='0' and sCBq="00" and sqcnt>0)then
+				dopop := '1';
+			end if;
+
+			qn := sqcnt;
+			if(dopop='1')then
+				for i in 0 to 2 loop
+					sqdrv(i)<=sqdrv(i+1);
+					sqerr(i)<=sqerr(i+1);
+					sqnr(i) <=sqnr(i+1);
+				end loop;
+				qn := qn - 1;
+			end if;
+			if(seekpush='1')then
+				if(qn<4)then
+					sqdrv(qn)<=conv_std_logic_vector(pushdrv,2);
+					sqerr(qn)<=pusherr;
+					sqnr(qn) <=readyv(pushdrv);
+					qn := qn + 1;
+				end if;
+			end if;
+			sqcnt<=qn;
+
+			SISclrd<=SISclr;
+			visv := sisvld;
+			if(SISclr='1' and SISclrd='0')then
+				visv(conv_integer(SISUS)) := '0';
+			end if;
+			if(dopop='1')then
+				visv(conv_integer(sqdrv(0))) := '1';
+			end if;
+			sisvld<=visv;
+			if(SISclr='1' and SISclrd='0' and visv/="0000")then
+				INTs<='1';
+			end if;
+
 			if(execstate=es_idle)then
 				sRQM<='1';
-				if(seek_end/="0000")then
-					sHD<=HD;
-					case seek_end is
-					when "0001" =>
-						sUS<="00";
-						PCN<=mPCN0;
-					when "0010" =>
-						sUS<="01";
-						PCN<=mPCN1;
-					when "0100" =>
-						sUS<="10";
-						PCN<=mPCN2;
-					when "1000" =>
-						sUS<="11";
-						PCN<=mPCN3;
+				if(dopop='1')then
+					vd := conv_integer(sqdrv(0));
+					case sqdrv(0) is
+					when "00" =>
+						sispcn(vd)<=mPCN0;
+					when "01" =>
+						sispcn(vd)<=mPCN1;
+					when "10" =>
+						sispcn(vd)<=mPCN2;
 					when others =>
+						sispcn(vd)<=mPCN3;
 					end case;
-					sIC<="00";
-					sHD<=HD;
-					sEC<='0';
-					sSE<='1';
-					sNR<=sREADY;
+					sisst0(vd)(3)<=sqnr(0);				-- NR, taken at completion time
+					sisst0(vd)(2)<=HD;					-- HD
+					sisst0(vd)(1 downto 0)<=sqdrv(0);	-- US, the drive that finished
+					if(sqerr(0)='0')then
+						sisst0(vd)(7 downto 6)<="00";	-- IC = normal termination
+						sisst0(vd)(5)<='1';				-- SE
+						sisst0(vd)(4)<='0';				-- EC
+					else
+						sisst0(vd)(7 downto 6)<="01";	-- IC = abnormal termination
+						sisst0(vd)(5)<='1';				-- SE
+						sisst0(vd)(4)<='1';				-- EC
+					end if;
 					INTs<='1';
-					-- iSE<='1';
-				elsif(seek_err/="0000")then
-					sIC<="01";
-					sHD<=HD;
-					case seek_err is
-					when "0001" =>
-						sUS<="00";
-						PCN<=mPCN0;
-					when "0010" =>
-						sUS<="01";
-						PCN<=mPCN1;
-					when "0100" =>
-						sUS<="10";
-						PCN<=mPCN2;
-					when "1000" =>
-						sUS<="11";
-						PCN<=mPCN3;
-					when others =>
-					end case;
-					sNR<=sREADY;
-					sHD<=HD;
-					sEC<='1';
-					sSE<='0';
-					INTs<='1';
-					-- iSE<='1';
 				end if;
 				if(EXEC='1')then
 					sIC<="00";
-					sNR<=READY;
+					sNR<=readyv(iUS);
 					sHD<=HD;
 					sUS<=US;
 					sOR<='0';
@@ -1535,9 +1634,7 @@ begin
 						end if;
 						nturns<=0;
 					when cmd_RECALIBRATE =>
-						seek_init<='1';
-						execstate<=es_seek;
---						execstate<=es_readychk;
+						execstate<=es_readychk;
 					when cmd_SEEK =>
 --						seek_bgn<='1';
 --						execstate<=es_seek;
@@ -1583,7 +1680,7 @@ begin
 							sHD<=HD;
 							sUS<=US;
 							sIC<="01";
-							sNR<=READY;
+							sNR<=readyv(iUS);
 							sEC<='0';
 							sSE<='0';
 							if(DETSECT='0')then
@@ -1601,7 +1698,7 @@ begin
 						sHD<=HD;
 						sUS<=US;
 						sIC<="11";
-						sNR<=READY;
+						sNR<=readyv(iUS);
 						sEC<='0';
 						sSE<='0';
 						sND<='0';
@@ -1620,7 +1717,7 @@ begin
 							deminit<='1';
 						elsif(seek_err(iUS)='1')then
 							sIC<="01";
-							sNR<=READY;
+							sNR<=readyv(iUS);
 							sEC<='1';
 							sSE<='0';
 							sHD<=HD;
@@ -1846,7 +1943,7 @@ begin
 									sUS<=US;
 									PCN<=cPCN;
 									sIC<="01";
-									sNR<=READY;
+									sNR<=readyv(iUS);
 									sEC<='0';
 									sSE<='0';
 									sWC<='1';
@@ -1972,7 +2069,7 @@ begin
 										sUS<=US;
 										PCN<=cPCN;
 										sIC<="00";
-										sNR<=READY;
+										sNR<=readyv(iUS);
 										sEC<='0';
 										sSE<='0';
 										INT<='1';
@@ -1996,7 +2093,7 @@ begin
 										sUS<=US;
 										PCN<=cPCN;
 										sIC<="00";
-										sNR<=READY;
+										sNR<=readyv(iUS);
 										sEC<='0';
 										sSE<='0';
 										INT<='1';
@@ -2068,6 +2165,7 @@ begin
 					when es_CRCdc =>
 						if(crcdone='1')then
 							if((crczero='1') or (ecommand=cmd_READATRACK))then
+								lastsect:='0';
 								if(R/=EOT)then
 									incR<='1';
 								elsif(MT='1')then
@@ -2080,15 +2178,17 @@ begin
 										resH<='1';
 										resHD<='1';
 										incC<='1';
+										lastsect:='1';
 									end if;
 								else
 									resR<='1';
 									incC<='1';
+									lastsect:='1';
 								end if;
 								sDE<='0';
 								if(sOR='1')then
 									sIC<="01";
-									sNR<=READY;
+									sNR<=readyv(iUS);
 									sEC<='0';
 									sSE<='0';
 									sHD<=HD;
@@ -2101,7 +2201,7 @@ begin
 								elsif(TCen='1')then
 									execstate<=es_IDLE;
 									sIC<="00";
-									sNR<=READY;
+									sNR<=readyv(iUS);
 									sEC<='0';
 									sSE<='0';
 									sHD<=HD;
@@ -2109,6 +2209,20 @@ begin
 									PCN<=cPCN;
 									INT<='1';
 									-- iSE<='1';
+									end_EXEC<='1';
+								elsif(lastsect='1')then
+									-- reached EOT without TC: end the command here with EN set, like the uPD765
+									-- (it used to look for sector EOT+1 for two turns and end with IC=01 and ND)
+									execstate<=es_IDLE;
+									sIC<="00";
+									sEN<='1';
+									sNR<=readyv(iUS);
+									sEC<='0';
+									sSE<='0';
+									sHD<=HD;
+									sUS<=US;
+									PCN<=cPCN;
+									INT<='1';
 									end_EXEC<='1';
 								else
 									nturns<=0;
@@ -2119,7 +2233,7 @@ begin
 							else
 								sDE<='1';
 								sIC<="01";
-								sNR<=READY;
+								sNR<=readyv(iUS);
 								sEC<='0';
 								sSE<='0';
 								sHD<=HD;
@@ -2138,7 +2252,7 @@ begin
 				when cmd_WRITEDATA | cmd_WRITEDELETEDDATA =>
 					if(WPRT='0')then
 						sIC<="01";
-						sNR<=READY;
+						sNR<=readyv(iUS);
 						sEC<='0';
 						sSE<='0';
 						sNW<='1';
@@ -2184,7 +2298,7 @@ begin
 							INT<='1';
 							-- iSE<='0';
 							sIC<="01";
-							sNR<=READY;
+							sNR<=readyv(iUS);
 							sEC<='0';
 							sSE<='0';
 							if (DETSECT='0')then
@@ -2199,7 +2313,7 @@ begin
 						sHD<=HD;
 						sUS<=US;
 						sIC<="11";
-						sNR<=READY;
+						sNR<=readyv(iUS);
 						sEC<='0';
 						sSE<='0';
 						sND<='0';
@@ -2218,7 +2332,7 @@ begin
 							deminit<='1';
 						elsif(seek_err(iUS)='1')then
 							sIC<="01";
-							sNR<=READY;
+							sNR<=readyv(iUS);
 							sEC<='1';
 							sSE<='0';
 							sHD<=HD;
@@ -2443,7 +2557,7 @@ begin
 									sUS<=US;
 									PCN<=cPCN;
 									sIC<="01";
-									sNR<=READY;
+									sNR<=readyv(iUS);
 									sEC<='0';
 									sSE<='0';
 									sWC<='1';
@@ -2513,7 +2627,7 @@ begin
 									sUS<=US;
 									PCN<=cPCN;
 									sIC<="00";
-									sNR<=READY;
+									sNR<=readyv(iUS);
 									sEC<='0';
 									sSE<='0';
 									INT<='1';
@@ -2579,7 +2693,7 @@ begin
 								sUS<=US;
 								PCN<=cPCN;
 								sIC<="00";
-								sNR<=READY;
+								sNR<=readyv(iUS);
 								sEC<='0';
 								sSE<='0';
 								INT<='1';
@@ -2621,7 +2735,7 @@ begin
 									sUS<=US;
 									PCN<=cPCN;
 									sIC<="00";
-									sNR<=READY;
+									sNR<=readyv(iUS);
 									sEC<='0';
 									sSE<='0';
 									INT<='1';
@@ -2691,6 +2805,7 @@ begin
 							if(bytecount>0)then
 								bytecount<=bytecount-1;
 							else
+								lastsect:='0';
 								if(R/=EOT)then
 									incR<='1';
 								elsif(MT='1')then
@@ -2703,17 +2818,19 @@ begin
 										resH<='1';
 										resHD<='1';
 										incC<='1';
+										lastsect:='1';
 									end if;
 								else
 									resR<='1';
 									incC<='1';
+									lastsect:='1';
 								end if;
 								if(sOR='1')then
 									sHD<=HD;
 									sUS<=US;
 									PCN<=cPCN;
 									sIC<="01";
-									sNR<=READY;
+									sNR<=readyv(iUS);
 									sEC<='0';
 									sSE<='0';
 									INT<='1';
@@ -2725,12 +2842,25 @@ begin
 									sIC<="00";
 									sHD<=HD;
 									sUS<=US;
-									sNR<=READY;
+									sNR<=readyv(iUS);
 									sEC<='0';
 									sSE<='0';
 									PCN<=cPCN;
 									INT<='1';
 									-- iSE<='1';
+									end_EXEC<='1';
+								elsif(lastsect='1')then
+									-- reached EOT without TC: end the command here with EN set, like the reads
+									execstate<=es_IDLE;
+									sIC<="00";
+									sEN<='1';
+									sHD<=HD;
+									sUS<=US;
+									sNR<=readyv(iUS);
+									sEC<='0';
+									sSE<='0';
+									PCN<=cPCN;
+									INT<='1';
 									end_EXEC<='1';
 								else
 									nturns<=0;
@@ -3031,7 +3161,7 @@ begin
 								sHD<=HD;
 								sUS<=US;
 								sIC<="01";
-								sNR<=READY;
+								sNR<=readyv(iUS);
 								sEC<='0';
 								sSE<='0';
 								if (DETSECT='0')then
@@ -3050,7 +3180,7 @@ begin
 						sHD<=HD;
 						sUS<=US;
 						sIC<="11";
-						sNR<=READY;
+						sNR<=readyv(iUS);
 						sEC<='0';
 						sSE<='0';
 						sND<='0';
@@ -3262,7 +3392,7 @@ begin
 							if(crczero='1')then
 								execstate<=es_IDLE;
 								sIC<="00";
-								sNR<=READY;
+								sNR<=readyv(iUS);
 								sEC<='0';
 								sSE<='0';
 								sHD<=HD;
@@ -3298,7 +3428,7 @@ begin
 							sHD<=HD;
 							sUS<=US;
 							sIC<="01";
-							sNR<=READY;
+							sNR<=readyv(iUS);
 							sEC<='0';
 							sSE<='0';
 							if(DETSECT='0')then
@@ -3316,7 +3446,7 @@ begin
 						sHD<=HD;
 						sUS<=US;
 						sIC<="11";
-						sNR<=READY;
+						sNR<=readyv(iUS);
 						sEC<='0';
 						sSE<='0';
 						sND<='0';
@@ -3335,7 +3465,7 @@ begin
 							deminit<='1';
 						elsif(seek_err(iUS)='1')then
 							sIC<="01";
-							sNR<=READY;
+							sNR<=readyv(iUS);
 							sEC<='1';
 							sSE<='0';
 							sHD<=HD;
@@ -3557,7 +3687,7 @@ begin
 									sUS<=US;
 									PCN<=cPCN;
 									sIC<="01";
-									sNR<=READY;
+									sNR<=readyv(iUS);
 									sEC<='0';
 									sSE<='0';
 									sWC<='1';
@@ -3678,7 +3808,7 @@ begin
 									sUS<=US;
 									PCN<=cPCN;
 									sIC<="00";
-									sNR<=READY;
+									sNR<=readyv(iUS);
 									sEC<='0';
 									sSE<='0';
 									INT<='1';
@@ -3700,7 +3830,7 @@ begin
 									sUS<=US;
 									PCN<=cPCN;
 									sIC<="00";
-									sNR<=READY;
+									sNR<=readyv(iUS);
 									sEC<='0';
 									sSE<='0';
 									INT<='1';
@@ -3741,7 +3871,7 @@ begin
 							else
 								sOR<='0';
 								sIC<="01";
-								sNR<=READY;
+								sNR<=readyv(iUS);
 								sEC<='0';
 								sSE<='0';
 								sHD<=HD;
@@ -3755,7 +3885,7 @@ begin
 						elsif((MF='0' and fmrxed='1') or (MF='1' and mfmrxed='1'))then
 							sOR<='1';
 							sIC<="01";
-							sNR<=READY;
+							sNR<=readyv(iUS);
 							sEC<='0';
 							sSE<='0';
 							sHD<=HD;
@@ -3802,6 +3932,7 @@ begin
 					when es_CRCdc =>
 						if(crcdone='1')then
 							if(crczero='1')then
+								lastsect:='0';
 								if(R/=EOT)then
 									incR<='1';
 								elsif(MT='1')then
@@ -3814,16 +3945,18 @@ begin
 										resH<='1';
 										resHD<='1';
 										incC<='1';
+										lastsect:='1';
 									end if;
 								else
 									resR<='1';
 									incC<='1';
+									lastsect:='1';
 								end if;
 								sDE<='0';
 								if(TCen='1')then
 									execstate<=es_IDLE;
 									sIC<="00";
-									sNR<=READY;
+									sNR<=readyv(iUS);
 									sEC<='0';
 									sSE<='0';
 									sHD<=HD;
@@ -3831,6 +3964,20 @@ begin
 									PCN<=cPCN;
 									INT<='1';
 									-- iSE<='1';
+									end_EXEC<='1';
+								elsif(lastsect='1')then
+									-- reached EOT without TC: end the command here with EN set, like the uPD765
+									-- (it used to look for sector EOT+1 for two turns and end with IC=01 and ND)
+									execstate<=es_IDLE;
+									sIC<="00";
+									sEN<='1';
+									sNR<=readyv(iUS);
+									sEC<='0';
+									sSE<='0';
+									sHD<=HD;
+									sUS<=US;
+									PCN<=cPCN;
+									INT<='1';
 									end_EXEC<='1';
 								else
 									nturns<=0;
@@ -3841,7 +3988,7 @@ begin
 							else
 								sDE<='1';
 								sIC<="01";
-								sNR<=READY;
+								sNR<=readyv(iUS);
 								sEC<='0';
 								sSE<='0';
 								sHD<=HD;
@@ -3861,7 +4008,7 @@ begin
 				when cmd_FORMATATRACK =>		--Format a Track
 					if(WPRT='0')then
 						sIC<="01";
-						sNR<=READY;
+						sNR<=readyv(iUS);
 						sEC<='0';
 						sSE<='0';
 						sNW<='1';
@@ -3878,7 +4025,7 @@ begin
 							sUS<=US;
 							PCN<=cPCN;
 							sIC<="01";
-							sNR<=READY;
+							sNR<=readyv(iUS);
 							sEC<='0';
 							sSE<='0';
 							INT<='1';
@@ -3891,7 +4038,7 @@ begin
 							sUS<=US;
 							PCN<=cPCN;
 							sIC<="00";
-							sNR<=READY;
+							sNR<=readyv(iUS);
 							sEC<='0';
 							sSE<='0';
 							INT<='1';
@@ -3903,7 +4050,7 @@ begin
 						sHD<=HD;
 						sUS<=US;
 						sIC<="11";
-						sNR<=READY;
+						sNR<=readyv(iUS);
 						sEC<='0';
 						sSE<='0';
 						sND<='0';
@@ -4060,7 +4207,7 @@ begin
 									sUS<=US;
 									PCN<=cPCN;
 									sIC<="00";
-									sNR<=READY;
+									sNR<=readyv(iUS);
 									sEC<='0';
 									sSE<='0';
 									INT<='1';
@@ -4100,7 +4247,7 @@ begin
 								sUS<=US;
 								PCN<=cPCN;
 								sIC<="00";
-								sNR<=READY;
+								sNR<=readyv(iUS);
 								sEC<='0';
 								sSE<='0';
 								INT<='1';
@@ -4146,7 +4293,7 @@ begin
 								sUS<=US;
 								PCN<=cPCN;
 								sIC<="00";
-								sNR<=READY;
+								sNR<=readyv(iUS);
 								sEC<='0';
 								sSE<='0';
 								INT<='1';
@@ -4397,7 +4544,7 @@ begin
 				when cmd_RECALIBRATE | cmd_SEEK =>		--re-calibrate  / seek
 					case execstate is
 					when es_readychk =>
-						if(READY='0')then
+						if(readyv(iUS)='0')then
 							case command is
 							when cmd_RECALIBRATE =>
 								seek_init<='1';
@@ -4406,17 +4553,26 @@ begin
 							when others =>
 							end case;
 							execstate<=es_seek;
-						elsif(NOTRDY='1')then
+						else
+							-- not ready: end at once with abnormal termination and SE
 							sHD<=HD;
 							sUS<=US;
-							sIC<="11";
-							sNR<=READY;
+							sIC<="01";
+							sNR<=readyv(iUS);
 							sEC<='0';
-							sSE<='0';
+							sSE<='1';
 							sND<='0';
 							sMA<='0';
 							PCN<=cPCN;
-							INT<='1';
+							sisst0(iUS)(7 downto 6)<="01";	-- IC = abnormal termination
+							sisst0(iUS)(5)<='1';			-- SE
+							sisst0(iUS)(4)<='0';			-- EC
+							sisst0(iUS)(3)<=readyv(iUS);	-- NR
+							sisst0(iUS)(2)<=HD;
+							sisst0(iUS)(1 downto 0)<=US;
+							sispcn(iUS)<=cPCN;
+							sisvld(iUS)<='1';
+							INTs<='1';
 							-- iSE<='0';
 							end_EXEC<='1';
 							execstate<=es_IDLE;
@@ -4464,36 +4620,41 @@ begin
 		end if;
 	end process;
 	
-	inttx	:clktx port map(INT,sINT,fclk,sclk,rstn);
-	intstx:clktx port map(INTs,sINTs,fclk,sclk,rstn);
+	inttx	:clktx generic map(oneclk) port map(INT,sINT,fclk,sclk,rstn,sce,rstns);
+	intstx:clktx generic map(oneclk) port map(INTs,sINTs,fclk,sclk,rstn,sce,rstns);
+	INTEV<=sINTs or sINT;
 	
-	process(sclk,rstn)begin
-		if(rstn='0')then
+	process(sclk,rstns)begin
+		if(rstns='0')then
 			INTn<='1';
-			SISen<='0';
 		elsif(sclk' event and sclk='1')then
-			if(sINTs='1')then
+		 if(sce='1')then
+			if(sINTs='1' or sINT='1')then
 				INTn<='0';
-				SISen<='1';
-			elsif(sINT='1')then
-				INTn<='0';
-				if(ismode='1')then
-					SISen<='1';
-				end if;
 			elsif(CPUWR_DAT='1' or CPURD_DAT='1')then	-- or CPURD_STA='1' or DMARDx='1' or DMAWRx='1'
 				INTn<='1';
 			end if;
-			if(SISclr='1')then
-				SISen<='0';
-			end if;
+		 end if;
 		end if;
 	end process;
 	
+	sisany<=sisvld(0) or sisvld(1) or sisvld(2) or sisvld(3);
+	sisdrv<="00" when sisvld(0)='1' else
+			"01" when sisvld(1)='1' else
+			"10" when sisvld(2)='1' else
+			"11";
+
 	sEXM<='1' when (execstate/=es_IDLE and ND='1') else '0';
 	ST0<=sIC &sSE & sEC & sNR & sHD & sUS;
 	ST1<=sEN & '0' & sDE & sOR & '0' & sND & sNW & sMA;
 	ST2<='0' & sCM & sDD & sWC & sSH & sSN & sBC & sMD;
-	ST3<='0' & not WPRT & not READY & not track0s & TWOSIDE & sideb & uselb;
+	--Nothing here sets SN or BC. Without a driver they were left to synthesis, which could
+	--turn them into 1.
+	sSN<='0';
+	sBC<='0';
+	--RY: the READY pin is tied active on this board, so the real machine reports
+	--ready for every drive, even drives 2 and 3 that are not there.
+	ST3<='0' & not WPRT & '1' & not track0s & TWOSIDE(conv_integer(uselb)) & sideb & uselb;
 	MSR<=sRQM & sDIO & sEXM & sCB & sDxB;
 	
 	RDAT<=	RDDAT_DAT when DACKn='0' else
@@ -4509,17 +4670,19 @@ begin
 	usel<=uselb when seekbusy='0' else seekusel;
 	
 	
-	process(sclk,rstn)
+	process(sclk,rstns)
 	variable	ext	:std_logic_vector(3 downto 0);
 	begin
-		if(rstn='0')then
+		if(rstns='0')then
 			sTC<='0';
 		elsif(sclk' event and sclk='1')then
+		 if(sce='1')then
 			if(TC='1')then
 				sTC<='1';
 			elsif(TCen='1')then
 				sTC<='0';
 			end if;
+		 end if;
 		end if;
 	end process;
 	
@@ -4545,6 +4708,7 @@ begin
 	process(fclk,rstn)begin
 		if(rstn='0')then
 			sDxB<=(others=>'0');
+			DxBclrd<='0';
 		elsif(fclk' event and fclk='1')then
 			for i in 0 to 3 loop
 				if(seek_busyv(i)='1')then
@@ -4554,8 +4718,9 @@ begin
 					sDxB(i)<='1';
 			end if;
 			end loop;
-			if(DxBclr='1')then
-				sDxB<=(others=>'0');
+			DxBclrd<=DxBclr;
+			if(DxBclr='1' and DxBclrd='0')then
+				sDxB(conv_integer(SISUS))<='0';
 			end if;
 		end if;
 	end process;
@@ -4602,7 +4767,7 @@ begin
 		
 		seek_end	=>seek_end,
 		seek_err	=>seek_err,
-		readyout	=>sREADY,
+		readyout	=>open,
 
 		seek_pend	=>seekpend,
 		busy	=>seekbusy,
@@ -4612,20 +4777,21 @@ begin
 		rstn	=>rstn
 	);
 
-	seek_cyl0<=iC0 when tdo(0)='1' else iC0*2 when (iC0*2)<maxtrack else maxtrack;
-	seek_cyl1<=iC1 when tdo(1)='1' else iC1*2 when (iC1*2)<maxtrack else maxtrack;
-	seek_cyl2<=iC2 when tdo(2)='1' else iC2*2 when (iC2*2)<maxtrack else maxtrack;
-	seek_cyl3<=iC3 when tdo(3)='1' else iC3*2 when (iC3*2)<maxtrack else maxtrack;
+	seek_cyl0<=iC0;
+	seek_cyl1<=iC1;
+	seek_cyl2<=iC2;
+	seek_cyl3<=iC3;
 	
 	seek_sft0	<=seek_sft when seekusel="00" else '0';
 	seek_sft1	<=seek_sft when seekusel="01" else '0';
 	seek_sft2	<=seek_sft when seekusel="10" else '0';
 	seek_sft3	<=seek_sft when seekusel="11" else '0';
 	
+	--No head settling time after a seek: the uPD765 has none.
 	hds0	:headseek generic map(maxtrack,30,0) port map(
 		desttrack	=>seek_cyl0,
 		destset		=>seek_bgnv(0),
-		setwait		=>30,
+		setwait		=>0,
 
 		curtrack	=>seek_cur0,
 	
@@ -4646,7 +4812,7 @@ begin
 	hds1	:headseek generic map(maxtrack,30,0) port map(
 		desttrack	=>seek_cyl1,
 		destset		=>seek_bgnv(1),
-		setwait		=>30,
+		setwait		=>0,
 	
 		curtrack	=>seek_cur1,
 	
@@ -4667,7 +4833,7 @@ begin
 	hds2	:headseek generic map(maxtrack,30,0) port map(
 		desttrack	=>seek_cyl2,
 		destset		=>seek_bgnv(2),
-		setwait		=>30,
+		setwait		=>0,
 	
 		curtrack	=>seek_cur2,
 	
@@ -4688,7 +4854,7 @@ begin
 	hds3	:headseek generic map(maxtrack,30,0) port map(
 		desttrack	=>seek_cyl3,
 		destset		=>seek_bgnv(3),
-		setwait		=>30,
+		setwait		=>0,
 	
 		curtrack	=>seek_cur3,
 	
@@ -4726,10 +4892,10 @@ begin
 	PCN2<=conv_std_logic_vector(seek_cur2,8);
 	PCN3<=conv_std_logic_vector(seek_cur3,8);
 	
-	mPCN0<=PCN0 when tdo(0)='1' else '0' & PCN0(7 downto 1);
-	mPCN1<=PCN1 when tdo(1)='1' else '0' & PCN1(7 downto 1);
-	mPCN2<=PCN2 when tdo(2)='1' else '0' & PCN2(7 downto 1);
-	mPCN3<=PCN3 when tdo(3)='1' else '0' & PCN3(7 downto 1);
+	mPCN0<=PCN0;
+	mPCN1<=PCN1;
+	mPCN2<=PCN2;
+	mPCN3<=PCN3;
 	
 	cPCN<=	mPCN0 when US="00" else
 				mPCN1 when US="01" else
@@ -4817,9 +4983,22 @@ port map(
 	rstn	=>rstn
 );
 
-	sftwidth<= bitwidth when MF='0' else bitwidth/2;
+	fr:if fracin generate
+	sftwidth<=
+				intf0	when US="00" and MF='0' else
+				intf1	when US="01" and MF='0' else
+				intf2	when US="10" and MF='0' else
+				intf3	when MF='0' else
+				intm0	when US="00" else
+				intm1	when US="01" else
+				intm2	when US="10" else
+				intm3;
+	end generate;
+	nfr:if not fracin generate
+	sftwidth<= bitwidth*256 when MF='0' else (bitwidth/2)*256;
+	end generate;
 	
-	sgen:sftgen generic map(maxbwidth*2) port map(
+	sgen:sftfrac generic map(maxfwidth) port map(
 		len		=>sftwidth,
 		sft		=>modsft,
 		
@@ -4869,7 +5048,7 @@ port map(
 
 	RDET	:NRDET generic map(rdytout*2) port map(
 		start	=>NRDSTART,
-		RDY		=>not READY,
+		RDY		=>not readyv(iUS),
 		
 		NOTRDY	=>NOTRDY,
 		

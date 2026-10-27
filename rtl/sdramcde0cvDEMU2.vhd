@@ -29,6 +29,7 @@ ENTITY SDRAMCde0cvDEMU2 IS
 		CPUWDAT			:in std_logic_vector(7 downto 0);
 		CPUWR				:in std_logic;
 		CPURD				:in std_logic;
+		CPURDV2			:in std_logic :='1';	--'1': a GVRAM-range read may use window 2 (not for text DMA)
 		CPUWAIT			:out std_logic;
 		CPUCLK			:out std_logic;
 		CPURSTn			:out std_logic;
@@ -41,6 +42,12 @@ ENTITY SDRAMCde0cvDEMU2 IS
 		SUBRD				:in std_logic;
 		SUBWAIT			:out std_logic;
 		SUBCLK			:out std_logic;
+		-- High for one memclk cycle on the cycles where SUBCLK rises / falls
+		SUBCE_R			:out std_logic;
+		SUBCE_F			:out std_logic;
+		-- The same for CPUCLK
+		CPUCE_R			:out std_logic;
+		CPUCE_F			:out std_logic;
 
 		ALURD0			:out std_logic_vector(7 downto 0);
 		ALURD1			:out std_logic_vector(7 downto 0);
@@ -61,25 +68,25 @@ ENTITY SDRAMCde0cvDEMU2 IS
 		VIDWAIT			:out std_logic;
 		
 		FDEADR			:in std_logic_vector(AWIDTH-1 downto 0)	:=(others=>'0');
-		FDERD				:in std_logic								:='0';
+		FDEREQ			:in std_logic								:='0';
 		FDEWR				:in std_logic								:='0';
 		FDERDAT			:out std_logic_Vector(15 downto 0);
 		FDEWDAT			:in std_logic_vector(15 downto 0)	:=(others=>'0');
-		FDEWAIT			:out std_logic;
+		FDEACK			:out std_logic;
 		
 		FECADR			:in std_logic_vector(AWIDTH-1 downto 0)	:=(others=>'0');
-		FECRD				:in std_logic								:='0';
+		FECREQ			:in std_logic								:='0';
 		FECWR				:in std_logic								:='0';
 		FECRDAT			:out std_logic_vector(15 downto 0);
 		FECWDAT			:in std_logic_vector(15 downto 0)	:=(others=>'0');
-		FECWAIT			:out std_logic;
+		FECACK			:out std_logic;
 		
 		SNDADR			:in std_logic_vector(AWIDTH-1 downto 0);
-		SNDRD				:in std_logic;
+		SNDREQ			:in std_logic;
 		SNDWR				:in std_logic;
 		SNDRDAT			:out std_logic_vector(7 downto 0);
 		SNDWDAT			:in std_logic_vector(7 downto 0);
-		SNDWAIT			:out std_logic;
+		SNDACK			:out std_logic;
 		SNDH_Ln			:in std_logic;
 		
 		monout			:out std_logic_vector(7 downto 0);
@@ -95,6 +102,8 @@ architecture MAIN of SDRAMCde0cvDEMU2 is
 type state_t is (
 	ST_REFRSH,
 	ST_READ,
+	ST_READ2,
+	ST_VREAD2,
 	ST_WRITE,
 	ST_VREAD,
 	ST_VWRITE,
@@ -134,7 +143,7 @@ constant clockwtime	:integer	:=50000;	--usec
 --constant clockwtime	:integer	:=2;	--usec
 constant cwaitcnt	:integer	:=clockwtime*86;	--clocks
 signal	CLOCKWAIT	:integer range 0 to cwaitcnt;
-signal	clkcount	:integer range 0 to 20;
+signal	clkcount	:integer range 0 to 18;
 -- signal	pCPUWR		:std_logic;
 -- signal	pCPURD		:std_logic;
 -- signal	pCPUADR			:std_logic_vector(AWIDTH-1 downto 0);
@@ -154,6 +163,8 @@ signal SUBWDATb	:std_logic_vector(7 downto 0);
 signal	VIDADRb	:std_logic_vector(AWIDTH-1 downto 0);
 
 signal	CPUWAITb	:std_logic;
+signal	CPURDV2b	:std_logic;
+signal	VREAD2W1	:std_logic;	--ST_VREAD2: the 2nd word is due in slot 13
 signal	VIDWAITb	:std_logic;
 signal	SUBWAITb	:std_logic;
 signal	FDEWAITb	:std_logic;
@@ -162,24 +173,16 @@ signal	SNDWAITb	:std_logic;
 
 signal	lCPUWR,lCPURD,lSUBWR,lSUBRD :std_logic_vector(3 downto 0);
 signal	lVIDRD	:std_logic_vector(1 downto 0);
-signal	sFDEADR	:std_logic_vector(AWIDTH-1 downto 0);
-signal	lFDEADR	:std_logic_vector(AWIDTH-1 downto 0);
-signal	fFDEADR	:std_logic_vector(AWIDTH-1 downto 0);
-signal	lFECADR	:std_logic_vector(AWIDTH-1 downto 0);
-signal	lFDEWR	:std_logic_vector(4 downto 0);
-signal	lFDERD	:std_logic_vector(4 downto 0);
-signal	lFECWR	:std_logic_vector(1 downto 0);
-signal	lFECRD	:std_logic_vector(1 downto 0);
-signal	lSNDWR	:std_logic_vector(2 downto 0);
-signal	lSNDRD	:std_logic_vector(2 downto 0);
+--FDE/FEC/SND: two-phase handshake. FDEREQ/FECREQ/SNDREQ arrive through
+--synchronizers; address, data and FDEWR/FECWR/SNDWR are held by the sender
+--until FDEACK/FECACK/SNDACK follows the request. FDEBSY/FECBSY/SNDBSY:
+--taken, ACK not yet given.
+signal	FDEACKb,FECACKb,SNDACKb	:std_logic;
+signal	FDEBSY,FECBSY,SNDBSY	:std_logic;
 signal	FDEADRb	:std_logic_vector(AWIDTH-1 downto 0);
-signal	pFDEADR	:std_logic_vector(AWIDTH-1 downto 0);
-signal	pFECADR	:std_logic_vector(AWIDTH-1 downto 0);
 signal	FDEWDATb	:std_logic_vector(15 downto 0);
-signal	sFDEWDAT	:std_logic_vector(15 downto 0);
 signal	FECADRb	:std_logic_vector(AWIDTH-1 downto 0);
 signal	FECWDATb	:std_logic_vector(15 downto 0);
-signal	lSNDADR	:std_logic_vector(AWIDTH-1 downto 0);
 signal	SNDADRb	:std_logic_vector(AWIDTH-1 downto 0);
 signal	SNDWDATb	:std_logic_vector(7 downto 0);
 
@@ -209,14 +212,16 @@ signal	MEMBA0		:STD_LOGIC;							-- SD-RAM BANK SELECT ADDRESS 0
 signal	MEMADR		:STD_LOGIC_VECTOR( 12 DOWNTO 0 );	-- SD-RAM ADDRESS
 signal	MEMDAT		:STD_LOGIC_VECTOR( 15 DOWNTO 0 );	-- SD-RAM DATA
 signal	MEMDATOE	:STD_LOGIC;
-signal	CLKSFT		:std_logic_vector(20 downto 0);
-signal	SUBCSFT		:std_logic_vector(20 downto 0);
+signal	CLKSFT		:std_logic_vector(18 downto 0);
+signal	SUBCSFT		:std_logic_vector(18 downto 0);
+signal	nextsubc	:std_logic_vector(18 downto 0);
+signal	nextcpuc	:std_logic_vector(18 downto 0);
 begin
 	
 	monout<="00000001" when STATE=ST_REFRSH else
-			"00000010" when STATE=ST_READ else
+			"00000010" when STATE=ST_READ or STATE=ST_READ2 else
 			"00000100" when STATE=ST_WRITE else
-			"00001000" when STATE=ST_VREAD else
+			"00001000" when STATE=ST_VREAD or STATE=ST_VREAD2 else
 			"00010000" when STATE=ST_VWRITE else
 			"00100000" when STATE=ST_VIDREAD else
 			"01000000" when STATE=ST_SUBREAD else
@@ -226,9 +231,9 @@ begin
 	CPUWAIT<=CPUWAITb;
 	VIDWAIT<=VIDWAITb;
 	SUBWAIT<=SUBWAITb;
-	FDEWAIT<=FDEWAITb;
-	FECWAIT<=FECWAITb;
-	SNDWAIT<=SNDWAITb;
+	FDEACK<=FDEACKb;
+	FECACK<=FECACKb;
+	SNDACK<=SNDACKb;
 	
 	process(memclk,rstn)begin
 		if(rstn='0')then
@@ -251,6 +256,8 @@ begin
 			CLOCKWAIT	<=cwaitcnt;
 			clkcount	<=0;
 			CPUWAITb	<='0';
+			CPURDV2b	<='0';
+			VREAD2W1	<='0';
 			VIDWAITb	<='0';
 			-- pCPUWR		<='0';
 			-- pCPURD		<='0';
@@ -272,16 +279,15 @@ begin
 			CPUWDATb	<=(others=>'0');
 			SUBADRb		<=(others=>'0');
 			SUBWDATb	<=(others=>'0');
-			lFDEADR<=(others=>'0');
-			sFDEADR<=(others=>'0');
-			pFDEADR<=(others=>'0');
 			FDEADRb<=(others=>'0');
-			lFECADR<=(others=>'0');
-			pFECADR<=(others=>'0');
+			FDEACKb<='0';
+			FDEBSY<='0';
 			FECADRb<=(others=>'0');
-			lSNDADR<=(others=>'0');
+			FECACKb<='0';
+			FECBSY<='0';
 			SNDADRb<=(others=>'0');
-			sFDEWDAT<=(others=>'0');
+			SNDACKb<='0';
+			SNDBSY<='0';
 		elsif(memclk' event and memclk='1')then
 --			if(lCPUWR(0)='0' and CPUWR='1')then
 			if(lCPUWR="0111")then
@@ -295,6 +301,14 @@ begin
 				CPUWAITb<='1';
 				CPUJOB<=JOB_RD;
 				CPUADRb<=CPUADR;
+				CPURDV2b<=CPURDV2;
+			end if;
+			--ST_VREAD2 takes its 2nd word in slot 13, after slot 11 has moved STATE on.
+			if(clkcount=12 and lSTATE=ST_VREAD2)then
+				VREAD2W1<='1';
+			elsif(clkcount=13 and VREAD2W1='1')then
+				VREAD2W1<='0';
+				CPUWAITb<='0';
 			end if;
 			if(lVIDRD="01" and VIDRD='1')then
 				VIDWAITb<='1';
@@ -314,51 +328,49 @@ begin
 				SUBJOB<=JOB_RD;
 				SUBADRb<=SUBADR;
 			end if;
-			if(sFDEADR=lFDEADR)then
-				fFDEADR<=lFDEADR;
-			end if;
-			if(lFDEWR="11111")then
-				if(pFDEADR/=fFDEADR or FDEWDATb/=sFDEWDAT)then
-					FDEADRb<=fFDEADR;
-					FDEWDATb<=sFDEWDAT;
-					pFDEADR<=fFDEADR;
+			--Take a request once. ACK follows one cycle after the job ends,
+			--so FDERDAT/FECRDAT/SNDRDAT are registered before it.
+			if(FDEREQ/=FDEACKb and FDEBSY='0')then
+				FDEADRb<=FDEADR;
+				FDEWDATb<=FDEWDAT;
+				if(FDEWR='1')then
 					FDEJOB<=JOB_WR;
-					FDEWAITb<='1';
-				end if;
-			elsif(lFDERD="11111")then
-				if((pFDEADR/=fFDEADR) and FDEJOB/=JOB_WR)then
-					FDEADRb<=fFDEADR;
-					pFDEADR<=fFDEADR;
+				else
 					FDEJOB<=JOB_RD;
-					FDEWDATb<=x"ffff";
-					FDEWAITb<='1';
 				end if;
+				FDEWAITb<='1';
+				FDEBSY<='1';
+			elsif(FDEBSY='1' and FDEWAITb='0')then
+				FDEACKb<=FDEREQ;
+				FDEBSY<='0';
 			end if;
-			if(lFECWR="11")then
-				if(pFECADR/=lFECADR)then
-					FECADRb<=lFECADR;
-					FECWDATb<=FECWDAT;
-					pFECADR<=lFECADR;
+			if(FECREQ/=FECACKb and FECBSY='0')then
+				FECADRb<=FECADR;
+				FECWDATb<=FECWDAT;
+				if(FECWR='1')then
 					FECJOB<=JOB_WR;
-					FECWAITb<='1';
-				end if;
-			elsif(lFECRD="11")then
-				if(pFECADR/=lFECADR)then
-					FECADRb<=lFECADR;
-					pFECADR<=lFECADR;
+				else
 					FECJOB<=JOB_RD;
-					FECWAITb<='1';
 				end if;
+				FECWAITb<='1';
+				FECBSY<='1';
+			elsif(FECBSY='1' and FECWAITb='0')then
+				FECACKb<=FECREQ;
+				FECBSY<='0';
 			end if;
-			if(lSNDRD="011")then
-					SNDADRb<=lSNDADR;
-					SNDJOB<=JOB_RD;
-					SNDWAITb<='1';
-			elsif(lSNDWR="011")then
-					SNDADRb<=lSNDADR;
-					SNDWDATb<=SNDWDAT;
+			if(SNDREQ/=SNDACKb and SNDBSY='0')then
+				SNDADRb<=SNDADR;
+				SNDWDATb<=SNDWDAT;
+				if(SNDWR='1')then
 					SNDJOB<=JOB_WR;
-					SNDWAITb<='1';
+				else
+					SNDJOB<=JOB_RD;
+				end if;
+				SNDWAITb<='1';
+				SNDBSY<='1';
+			elsif(SNDBSY='1' and SNDWAITb='0')then
+				SNDACKb<=SNDREQ;
+				SNDBSY<='0';
 			end if;
 			if(INITTIMER>0)then
 				if(INITTIMER=1)then
@@ -771,7 +783,28 @@ begin
 						MEMADR(12 downto 11)	<="11";
 						MEMDAT		<=ALUWD1 & ALUWD0;
 						MEMDATOE	<='1';
-					elsif(STATE=ST_REFRSH or STATE=ST_INITREF or STATE=ST_INITPALL or STATE=ST_SUBREAD or STATE=ST_SUBWRITE)then	-- refresh
+					elsif(STATE=ST_REFRSH and SUBJOB=JOB_NOP and CPUJOB=JOB_RD and (CPUADRb(AWIDTH-1 downto 15)/=ADDR_GVRAM(AWIDTH-1 downto 15) or CPURDV2b='1'))then
+						-- Window 1 was idle: serve a main CPU read that arrived after the slot 18 arbitration.
+						if(CPUADRb(AWIDTH-1 downto 15)=ADDR_GVRAM(AWIDTH-1 downto 15))then
+							STATE<=ST_VREAD2;
+						else
+							STATE<=ST_READ2;
+						end if;
+						MEMCKE		<='1';	--Bank active
+						MEMCS_N		<='0';
+						MEMRAS_N		<='0';
+						MEMCAS_N		<='1';
+						MEMWE_N		<='1';
+						MEMUDQ		<='1';
+						MEMLDQ		<='1';
+						MEMBA1		<=CPUADRb(AWIDTH-1);
+						MEMBA0		<=CPUADRb(AWIDTH-2);
+						MEMADR		<=CPUADRb(AWIDTH-3 downto CAWIDTH);
+						MEMDATOE		<='0';
+						CPUJOB		<=JOB_NOP;
+					-- A waiting sub CPU access takes window 2 even when window 1 was idle.
+					-- Window 1 is idle more often now that main CPU reads can use window 2.
+					elsif((STATE=ST_REFRSH and SUBJOB=JOB_NOP) or STATE=ST_INITREF or STATE=ST_INITPALL or STATE=ST_SUBREAD or STATE=ST_SUBWRITE)then	-- refresh
 --					if(((STATE=ST_VREAD or STATE=ST_READ or STATE=ST_WRITE)) or STATE=ST_REFRSH or STATE=ST_INITREF or STATE=ST_INITPALL)then	-- refresh
 						MEMCKE		<='1';	--Auto refresh
 						MEMCS_N		<='0';
@@ -817,6 +850,25 @@ begin
 						MEMADR		<=SUBADRb(AWIDTH-3 downto CAWIDTH);
 						MEMDATOE		<='0';
 						SUBJOB		<=JOB_NOP;
+					elsif((STATE=ST_FDEREAD or STATE=ST_FDEWRITE or STATE=ST_FECREAD or STATE=ST_FECWRITE or STATE=ST_SNDREAD or STATE=ST_SNDWRITE) and CPUJOB=JOB_RD and (CPUADRb(AWIDTH-1 downto 15)/=ADDR_GVRAM(AWIDTH-1 downto 15) or CPURDV2b='1'))then
+						-- Window 1 went to FDC/FDC-EC/sound: serve the waiting main CPU read here.
+						if(CPUADRb(AWIDTH-1 downto 15)=ADDR_GVRAM(AWIDTH-1 downto 15))then
+							STATE<=ST_VREAD2;
+						else
+							STATE<=ST_READ2;
+						end if;
+						MEMCKE		<='1';	--Bank active
+						MEMCS_N		<='0';
+						MEMRAS_N		<='0';
+						MEMCAS_N		<='1';
+						MEMWE_N		<='1';
+						MEMUDQ		<='1';
+						MEMLDQ		<='1';
+						MEMBA1		<=CPUADRb(AWIDTH-1);
+						MEMBA0		<=CPUADRb(AWIDTH-2);
+						MEMADR		<=CPUADRb(AWIDTH-3 downto CAWIDTH);
+						MEMDATOE		<='0';
+						CPUJOB		<=JOB_NOP;
 					elsif(STATE=ST_WRITE or STATE=ST_READ or STATE=ST_FDEREAD or STATE=ST_FDEWRITE or STATE=ST_FECREAD or STATE=ST_FECWRITE or STATE=ST_SNDREAD or STATE=ST_SNDWRITE)then
 						STATE<=ST_REFRSH;
 						REFCNT<=REFINT-1;
@@ -920,6 +972,30 @@ begin
 						MEMADR		<="100" & SUBADRb(9 downto 0);
 						MEMDAT		<=x"00" & SUBWDATb;
 						MEMDATOE		<='1';
+					when ST_READ2 =>
+						MEMCKE		<='1';	--Read
+						MEMCS_N		<='0';
+						MEMRAS_N		<='1';
+						MEMCAS_N		<='0';
+						MEMWE_N		<='1';
+						MEMUDQ		<='1';
+						MEMLDQ		<='0';
+						MEMBA1		<=CPUADRb(AWIDTH-1);
+						MEMBA0		<=CPUADRb(AWIDTH-2);
+						MEMADR		<="100" & CPUADRb(9 downto 0);
+						MEMDATOE		<='0';
+					when ST_VREAD2 =>
+						MEMCKE		<='1';	--Read, both words as in ST_VREAD
+						MEMCS_N		<='0';
+						MEMRAS_N		<='1';
+						MEMCAS_N		<='0';
+						MEMWE_N		<='1';
+						MEMUDQ		<='0';
+						MEMLDQ		<='0';
+						MEMBA1		<=CPUADRb(AWIDTH-1);
+						MEMBA0		<=CPUADRb(AWIDTH-2);
+						MEMADR		<="000" & CPUADRb(9 downto 0);
+						MEMDATOE		<='0';
 					when others =>
 						MEMCKE		<='1';	--nop
 						MEMCS_N		<='1';
@@ -947,6 +1023,18 @@ begin
 						MEMBA1		<='0';
 						MEMBA0		<='0';
 						MEMADR		<=(others=>'1');
+						MEMDATOE		<='0';
+					when ST_VREAD2 =>
+						MEMCKE		<='1';	--Read(cont.): DQM low for the 2nd word
+						MEMCS_N		<='1';
+						MEMRAS_N		<='1';
+						MEMCAS_N		<='1';
+						MEMWE_N		<='1';
+						MEMUDQ		<='0';
+						MEMLDQ		<='0';
+						MEMBA1		<='0';
+						MEMBA0		<='0';
+						MEMADR		<=(others=>'0');
 						MEMDATOE		<='0';
 					when ST_SUBWRITE =>
 						MEMCKE		<='1';	--Precharge all
@@ -977,7 +1065,7 @@ begin
 					end case;
 				when 10 =>
 					case STATE is
-					when ST_SUBREAD =>
+					when ST_SUBREAD | ST_READ2 | ST_VREAD2 =>
 						MEMCKE		<='1';	--precharge all banks
 						MEMCS_N		<='0';
 						MEMRAS_N		<='0';
@@ -1003,10 +1091,9 @@ begin
 						MEMADR(12 downto 11)	<="11";
 						MEMDATOE		<='0';
 					end case;
-				when 13 =>
-					if(STATE=ST_SUBREAD)then
-						SUBWAITb<='0';
-					end if;
+				when 11 =>
+					-- SUBWAITb is not released here: SUBRDAT1 is captured in slot 12,
+					-- so releasing it in this slot would signal the sub CPU a tick early.
 					if(STATE/=ST_INITREF and STATE/=ST_INITMRS and STATE/=ST_INITPALL)then
 						if(VIDJOB=JOB_RD)then
 							STATE<=ST_VIDREAD;
@@ -1028,7 +1115,15 @@ begin
 					MEMADR(10 downto 0)	<=(others=>'0');
 					MEMADR(12 downto 11)	<="11";
 					MEMDATOE		<='0';
-				when 14 =>
+				when 12 =>
+					-- Release SUBWAITb in the same slot and on the same condition as the
+					-- SUBRDAT1 capture. STATE was already reassigned in slot 11, so use lSTATE.
+					if(lSTATE=ST_SUBREAD)then
+						SUBWAITb<='0';
+					end if;
+					if(lSTATE=ST_READ2)then
+						CPUWAITb<='0';
+					end if;
 					case STATE is
 					when ST_VIDREAD =>
 						MEMCKE		<='1';	--Bank active
@@ -1069,7 +1164,7 @@ begin
 						MEMADR(12 downto 11)	<="11";
 						MEMDATOE		<='0';
 					end case;
-				when 16 =>
+				when 14 =>
 					case STATE is
 					when ST_VIDREAD =>	--Read
 						MEMCKE		<='1';
@@ -1097,7 +1192,7 @@ begin
 						MEMADR(12 downto 11)	<="11";
 						MEMDATOE		<='0';
 					end case;
-				when 17	=>
+				when 15	=>
 					case STATE is
 					when ST_VIDREAD =>
 						MEMCKE		<='1';	--Read(cont.)
@@ -1125,7 +1220,7 @@ begin
 						MEMADR(12 downto 11)	<="11";
 						MEMDATOE		<='0';
 					end case;
-				when 18 =>
+				when 16 =>
 					case STATE is
 					when ST_VIDREAD =>
 						MEMCKE		<='1';	--precharge all banks
@@ -1153,7 +1248,7 @@ begin
 						MEMADR(12 downto 11)	<="11";
 						MEMDATOE		<='0';
 					end case;
-				when 19 =>
+				when 17 =>
 					MEMCKE		<='1';	--nop
 					MEMCS_N		<='1';
 					MEMRAS_N		<='1';
@@ -1166,7 +1261,7 @@ begin
 					MEMADR(10 downto 0)	<=(others=>'0');
 					MEMADR(12 downto 11)	<="11";
 					MEMDATOE		<='0';
-				when 20 =>
+				when 18 =>
 					MEMCKE		<='1';	--nop
 					MEMCS_N		<='1';
 					MEMRAS_N		<='1';
@@ -1255,7 +1350,7 @@ begin
 					MEMADR(12 downto 11)	<="11";
 					MEMDATOE	<='0';
 				end case;
-				if(clkcount=20)then
+				if(clkcount=18)then
 					clkcount<=0;
 				else
 					clkcount<=clkcount+1;
@@ -1266,17 +1361,6 @@ begin
 			lSUBWR<=lSUBWR(2 downto 0) & SUBWR;
 			lSUBRD<=lSUBRD(2 downto 0) & SUBRD;
 			lVIDRD<=lVIDRD(0) & VIDRD;
-			lFDERD<=lFDERD(3 downto 0) & FDERD;
-			lFDEWR<=lFDEWR(3 downto 0) & FDEWR;
-			lFECRD<=lFECRD(0) & FECRD;
-			lFECWR<=lFECWR(0) & FECWR;
-			lSNDRD<=lSNDRD(1 downto 0) & SNDRD;
-			lSNDWR<=lSNDWR(1 downto 0) & SNDWR;
-			sFDEADR<=FDEADR;
-			lFDEADR<=sFDEADR;
-			lFECADR<=FECADR;
-			lSNDADR<=SNDADR;
-			sFDEWDAT<=FDEWDAT;
 			lSTATE<=STATE;
 		end if;
 	end process;
@@ -1346,12 +1430,36 @@ begin
 					end if;
 					MRAMDAT<=PMEMDAT(15 downto 8);
 				end if;
-			when 13 =>
-				if(STATE=ST_SUBREAD)then
+			when 12 =>
+				-- lSTATE: window 3 arbitration in slot 11 has already reassigned STATE.
+				if(lSTATE=ST_SUBREAD)then
 					SUBRDAT1<=PMEMDAT(7 downto 0);
 					SUBRSEL<='1';
 				end if;
-			when 20 =>
+				if(lSTATE=ST_READ2)then
+					CPURDAT<=PMEMDAT(7 downto 0);
+					MRAMDAT<=PMEMDAT(7 downto 0);
+				end if;
+				if(lSTATE=ST_VREAD2)then
+					ALURD0<=PMEMDAT(7 downto 0);
+					ALURD1<=PMEMDAT(15 downto 8);
+					if(VRAMRSEL=0)then
+						CPURDAT<=PMEMDAT(7 downto 0);
+					elsif(VRAMRSEL=1)then
+						CPURDAT<=PMEMDAT(15 downto 8);
+					end if;
+				end if;
+			when 13 =>
+				if(VREAD2W1='1')then
+					ALURD2<=PMEMDAT(7 downto 0);
+					if(VRAMRSEL=2)then
+						CPURDAT<=PMEMDAT(7 downto 0);
+					elsif(VRAMRSEL=3)then
+						CPURDAT<=PMEMDAT(15 downto 8);
+					end if;
+					MRAMDAT<=PMEMDAT(15 downto 8);
+				end if;
+			when 18 =>
 				if(STATE=ST_VIDREAD)then
 					VIDDAT0<=PMEMDAT(7 downto 0);
 					VIDDAT1<=PMEMDAT(15 downto 8);
@@ -1387,33 +1495,56 @@ begin
 			CPURSTn<='0';
 			-- CLKMb<='0';
 			CLKSFT<=(others=>'0');
+			SUBCSFT<=(others=>'0');
 		else
 			if(STATE=ST_INITREF or STATE=ST_INITMRS or STATE=ST_INITPALL)then
 				CPURSTn<='0';
 			else
 				CPURSTn<='1';
-				if(clkcount=20)then
+				if(clkcount=18)then
 					-- CLKMb<=CLOCKM;
+					-- 19-tick round: one rising edge = 75/19 = 3.947 MHz, two = 7.895 MHz
 					if(CLOCKM='1')then
-						CLKSFT<="000001111100000111111";
+						CLKSFT<="0000011111000011111";
 					else
-						CLKSFT<="000001111111111000000";
+						CLKSFT<="0000011111111100000";
 					end if;
 				else
-					CLKSFT<=CLKSFT(19 downto 0) & CLKSFT(20);
+					CLKSFT<=CLKSFT(17 downto 0) & CLKSFT(18);
 				end if;
-				if(clkcount=20)then
-					SUBCSFT<="000001111100000111111";
+				if(clkcount=18)then
+					-- Sub CPU: one rising edge per round = 75/19 = 3.947 MHz
+					SUBCSFT<="0000011111111100000";
 				else
-					SUBCSFT<=SUBCSFT(19 downto 0) & SUBCSFT(20);
+					SUBCSFT<=SUBCSFT(17 downto 0) & SUBCSFT(18);
 				end if;
 				
 			end if;
 		end if;
 		end if;
 	end process;
-	CPUCLK<=CLKSFT(20);
-	SUBCLKb<=SUBCSFT(20);
+	CPUCLK<=CLKSFT(18);
+	SUBCLKb<=SUBCSFT(18);
+
+	-- Next value of SUBCSFT, following the process above (cleared in reset,
+	-- during SDRAM init, reloaded at clkcount=18, rotated otherwise).
+	nextsubc<=	(others=>'0')				when rstn='0' else
+				SUBCSFT						when (STATE=ST_INITREF or STATE=ST_INITMRS or STATE=ST_INITPALL) else
+				"0000011111111100000"		when clkcount=18 else
+				SUBCSFT(17 downto 0) & SUBCSFT(18);
+	SUBCE_R<='1' when SUBCSFT(18)='0' and nextsubc(18)='1' else '0';
+	SUBCE_F<='1' when SUBCSFT(18)='1' and nextsubc(18)='0' else '0';
+
+	-- Next value of CLKSFT, following the same process (cleared in reset, held
+	-- during SDRAM init, reloaded by CLOCKM at clkcount=18, rotated otherwise).
+	nextcpuc<=	(others=>'0')				when rstn='0' else
+				CLKSFT						when (STATE=ST_INITREF or STATE=ST_INITMRS or STATE=ST_INITPALL) else
+				"0000011111000011111"		when clkcount=18 and CLOCKM='1' else
+				"0000011111111100000"		when clkcount=18 else
+				CLKSFT(17 downto 0) & CLKSFT(18);
+	CPUCE_R<='1' when CLKSFT(18)='0' and nextcpuc(18)='1' else '0';
+	CPUCE_F<='1' when CLKSFT(18)='1' and nextcpuc(18)='0' else '0';
+
 	ALUCWD<=CPUWDATb;
 	SUBCLK<=SUBCLKb;
 	
