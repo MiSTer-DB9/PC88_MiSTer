@@ -91,8 +91,13 @@ signal	EOT		:std_logic_vector(7 downto 0);
 signal	GPL		:std_logic_vector(7 downto 0);
 signal	HD		:std_logic;
 signal	H		:std_logic_vector(7 downto 0);
--- signal	HLT		:std_logic_vector(6 downto 0);
--- signal	HUT		:std_logic_vector(3 downto 0);
+signal	HLT		:std_logic_vector(6 downto 0);
+signal	HUT		:std_logic_vector(3 downto 0);
+-- the head load: hdld is 1 while the head is loaded, HLT is waited before the head is loaded, HUT after the last execution
+signal	hdld	:std_logic;
+signal	hlrun	:std_logic;
+signal	hlcnt	:integer range 0 to 128*8;
+signal	hucnt	:integer range 0 to 16*64;
 signal	MF		:std_logic;
 signal	MT		:std_logic;
 signal	N		:std_logic_vector(7 downto 0);
@@ -372,6 +377,7 @@ signal	track0s		:std_logic;
 signal	TCclr		:std_logic;
 signal	sTC			:std_logic;
 signal	TCen		:std_logic;
+signal	skipsect	:std_logic;	--SK=1: a sector whose data mark does not match is skipped
 
 signal	INT		:std_logic;		--interrupt start
 signal	INTs		:std_logic;		--interrput at seek/re-carib.
@@ -793,8 +799,8 @@ begin
 			EOT		<=(others=>'0');
 			GPL		<=(others=>'0');
 			HD		<='0';
-			-- HLT		<=(others=>'0');
-			-- HUT		<=(others=>'0');
+			HLT		<=(others=>'0');
+			HUT		<=(others=>'0');
 			MF		<='0';
 			MT		<='0';
 			N		<=(others=>'0');
@@ -1198,13 +1204,13 @@ begin
 					case datnum is
 					when 1 =>
 						if(CPUWR_DAT='1')then
-							-- HUT<=CPUWRDAT(3 downto 0);
+							HUT<=CPUWRDAT(3 downto 0);
 							SRT<=CPUWRDAT(7 downto 4);
 							datnum<=datnum+1;
 						end if;
 					when 2 =>
 						if(CPUWR_DAT='1')then
-							-- HLT<=CPUWRDAT(7 downto 1);
+							HLT<=CPUWRDAT(7 downto 1);
 							ND<=CPUWRDAT(0);
 							RD_CMD<='1';
 							datnum<=0;
@@ -1358,6 +1364,7 @@ begin
 			rxN<=(others=>'0');
 			-- contdata<='0';
 			TCclr<='0';
+			skipsect<='0';
 			INT<='0';
 			INTs<='0';
 			DMARQ<='0';
@@ -1546,6 +1553,8 @@ begin
 					-- contdata<='0';
 					sRQM<='0';
 					sCM<='0';
+					skipsect<='0';
+					TCclr<='1';	-- a TC from the previous command does not carry over
 					DETSECT<='0';
 					NRDSTART<='1';
 					ecommand<=command;
@@ -1647,7 +1656,7 @@ begin
 			else
 				case ecommand is
 				when cmd_READDATA | cmd_READDELETEDDATA | cmd_READATRACK  =>
-					if(execstate/=es_seek and lindex='1' and indexb='0')then
+					if(execstate/=es_seek and not(execstate=es_wseek and hdld='0') and lindex='1' and indexb='0')then
 --						if(contdata='1')then
 --							if(MT='1' and HD='0')then
 --								nturns<=0;
@@ -1728,7 +1737,7 @@ begin
 							execstate<=es_idle;
 						end if;
 					when es_wseek =>
-						if(seekbusy='0')then
+						if(seekbusy='0' and hdld='1')then
 							if(ecommand=cmd_READATRACK)then
 								execstate<=es_windex;
 							else
@@ -1978,6 +1987,12 @@ begin
 								TCclr<='1';
 								sMD<='0';
 								execstate<=es_DATA;
+							elsif((ecommand=cmd_READDATA or ecommand=cmd_READDELETEDDATA) and SK='1' and (fmmf8det='1' or fmmfbdet='1'))then
+								-- SK=1: skip this sector and go on as if it was read (CM is set above)
+								dembreak<='1';
+								sMD<='0';
+								skipsect<='1';
+								execstate<=es_CRCdc;
 							elsif(fmmf8det='1' or fmmfbdet='1'or fmmfcdet='1' or fmmfedet='1' or fmrxed='1')then
 								dembreak<='1';
 								crcclr<='1';
@@ -2050,6 +2065,12 @@ begin
 							TCclr<='1';
 							sMD<='0';
 							execstate<=es_DATA;
+						elsif(mfmrxed='1' and (ecommand=cmd_READDATA or ecommand=cmd_READDELETEDDATA) and SK='1' and (mfmrxdat=x"f8" or mfmrxdat=x"fb"))then
+							-- SK=1: skip this sector and go on as if it was read (CM is set above)
+							dembreak<='1';
+							sMD<='0';
+							skipsect<='1';
+							execstate<=es_CRCdc;
 						elsif(mfmma1det='1' or mfmmc2det='1' or mfmrxed='1')then
 							dembreak<='1';
 							crcclr<='1';
@@ -2163,8 +2184,9 @@ begin
 							end if;
 						end if;
 					when es_CRCdc =>
-						if(crcdone='1')then
-							if((crczero='1') or (ecommand=cmd_READATRACK))then
+						if(crcdone='1' or skipsect='1')then
+							if((crczero='1') or (ecommand=cmd_READATRACK) or (skipsect='1'))then
+								skipsect<='0';
 								lastsect:='0';
 								if(R/=EOT)then
 									incR<='1';
@@ -2198,6 +2220,25 @@ begin
 									-- iSE<='0';									INT<='1';
 									execstate<=es_IDLE;
 									end_EXEC<='1';
+								elsif(SK='0' and sCM='1' and (ecommand=cmd_READDATA or ecommand=cmd_READDELETEDDATA))then
+									-- SK=0: end after the sector whose data mark does not match, without advancing
+									incR<='0';
+									resR<='0';
+									setH<='0';
+									setHD<='0';
+									resH<='0';
+									resHD<='0';
+									incC<='0';
+									execstate<=es_IDLE;
+									sIC<="00";
+									sNR<=readyv(iUS);
+									sEC<='0';
+									sSE<='0';
+									sHD<=HD;
+									sUS<=US;
+									PCN<=cPCN;
+									INT<='1';
+									end_EXEC<='1';
 								elsif(TCen='1')then
 									execstate<=es_IDLE;
 									sIC<="00";
@@ -2211,10 +2252,13 @@ begin
 									-- iSE<='1';
 									end_EXEC<='1';
 								elsif(lastsect='1')then
-									-- reached EOT without TC: end the command here with EN set, like the uPD765
-									-- (it used to look for sector EOT+1 for two turns and end with IC=01 and ND)
+									-- reached EOT without TC: end the command here with IC=01 and EN, keeping C, H and R
+									-- (as measured on a PC-8801FH; it used to look for sector EOT+1 for two turns and end with ND)
+									resR<='0';
+									resH<='0';
+									incC<='0';
 									execstate<=es_IDLE;
-									sIC<="00";
+									sIC<="01";
 									sEN<='1';
 									sNR<=readyv(iUS);
 									sEC<='0';
@@ -2263,7 +2307,7 @@ begin
 						-- iSE<='0';
 						end_EXEC<='1';
 						execstate<=es_IDLE;
-					elsif(execstate/=es_seek and lindex='1' and indexb='0')then
+					elsif(execstate/=es_seek and not(execstate=es_wseek and hdld='0') and lindex='1' and indexb='0')then
 --						if(contdata='1')then
 --							if(MT='1' and HD='0')then
 --								nturns<=0;
@@ -2343,7 +2387,7 @@ begin
 							execstate<=es_idle;
 						end if;
 					when es_wseek =>
-						if(seekbusy='0')then
+						if(seekbusy='0' and hdld='1')then
 							execstate<=es_IAM0;
 						end if;
 					when es_windex =>
@@ -2850,9 +2894,12 @@ begin
 									-- iSE<='1';
 									end_EXEC<='1';
 								elsif(lastsect='1')then
-									-- reached EOT without TC: end the command here with EN set, like the reads
+									-- reached EOT without TC: end the command here with IC=01 and EN, keeping C, H and R, like the reads
+									resR<='0';
+									resH<='0';
+									incC<='0';
 									execstate<=es_IDLE;
-									sIC<="00";
+									sIC<="01";
 									sEN<='1';
 									sHD<=HD;
 									sUS<=US;
@@ -3147,7 +3194,7 @@ begin
 --						execstate<=es_idle;
 --					end case;
 				when cmd_READID =>
-					if(execstate/=es_seek and lindex='1' and indexb='0')then
+					if(execstate/=es_seek and not(execstate=es_wseek and hdld='0') and lindex='1' and indexb='0')then
 						if(nturns=0)then
 --							if(nturns=2 and MT='1' and HD='0')then
 --								nturns<=0;
@@ -3193,7 +3240,7 @@ begin
 					end if;
 					case execstate is
 					when es_wseek =>
-						if(seekbusy='0')then
+						if(seekbusy='0' and hdld='1')then
 							execstate<=es_IAM0;
 						end if;
 					when es_IAM0 =>
@@ -3421,7 +3468,7 @@ begin
 					end case;
 
 				when cmd_SCANEQUAL | cmd_SCANLOWEQUAL| cmd_SCANHIGHEQUAL =>
-					if(execstate/=es_seek and lindex='1' and indexb='0')then
+					if(execstate/=es_seek and not(execstate=es_wseek and hdld='0') and lindex='1' and indexb='0')then
 						if(nturns=0)then
 							nturns<=1;
 						else
@@ -3476,7 +3523,7 @@ begin
 							execstate<=es_idle;
 						end if;
 					when es_wseek =>
-						if(seekbusy='0')then
+						if(seekbusy='0' and hdld='1')then
 							execstate<=es_IAM0;
 						end if;
 					when es_windex =>
@@ -4018,7 +4065,7 @@ begin
 						-- iSE<='0';
 						end_EXEC<='1';
 						execstate<=es_IDLE;
-					elsif(lindex='1' and indexb='0')then
+					elsif(execstate/=es_wseek and lindex='1' and indexb='0')then
 						if(sOR='1')then
 							modbreak<='1';
 							sHD<=HD;
@@ -4063,7 +4110,7 @@ begin
 					end if;
 					case execstate is
 					when es_wseek =>
-						if(seekbusy='0')then
+						if(seekbusy='0' and hdld='1')then
 							execstate<=es_windex;
 						end if;
 					when es_windex =>
@@ -4729,6 +4776,49 @@ begin
 --	sDxB(1)<=seek_busy1;
 --	sDxB(2)<=seek_busy2;
 --	sDxB(3)<=seek_busy3;
+
+	-- the head load and unload times of the SPECIFY, at the 4MHz FDC clock of the PC-8801 (HLT in 4ms, HUT in 32ms, 0 is the largest)
+	process(fclk,rstn)begin
+		if(rstn='0')then
+			hdld<='0';
+			hlrun<='0';
+			hlcnt<=0;
+			hucnt<=0;
+		elsif(fclk' event and fclk='1')then
+			if(execstate=es_wseek and hdld='0')then
+				if(hlrun='0')then
+					hlrun<='1';
+					if(HLT="0000000")then
+						hlcnt<=128*8;
+					else
+						hlcnt<=conv_integer(HLT)*8;
+					end if;
+				elsif(hmssft='1')then
+					if(hlcnt<=1)then
+						hdld<='1';
+						hlrun<='0';
+					else
+						hlcnt<=hlcnt-1;
+					end if;
+				end if;
+			else
+				hlrun<='0';
+			end if;
+			-- SEEK and RECALIBRATE do not restart the unload time; it counts from the end of a read or write
+			if(hdld='1' and (execstate=es_idle or ecommand=cmd_SEEK or ecommand=cmd_RECALIBRATE))then
+				if(hmssft='1')then
+					if((HUT="0000" and hucnt>=16*64-1) or (HUT/="0000" and hucnt>=conv_integer(HUT)*64-1))then
+						hdld<='0';
+						hucnt<=0;
+					else
+						hucnt<=hucnt+1;
+					end if;
+				end if;
+			else
+				hucnt<=0;
+			end if;
+		end if;
+	end process;
 
 	sksft	:sftdiv generic map(4) port map(
 		sel		=>not SRT,

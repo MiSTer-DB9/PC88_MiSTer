@@ -271,7 +271,7 @@ assign VGA_SCALER = 0; // 24kHz, 15kHz: VGA as set in MiSTer.ini (vga_scaler)
 
 assign LED_POWER = 0;
 assign BUTTONS = 0;
-assign AUDIO_MIX = 0;
+assign AUDIO_MIX = status[30:29];
 assign HDMI_FREEZE = 0;
 assign HDMI_BLACKOUT = 0;
 assign HDMI_BOB_DEINT = 0;
@@ -312,6 +312,7 @@ parameter CONF_STR = {
 	"-;",
 	"OK,Input,Joypad,Mouse;",
 	"OLM,Sound Board,Normal(SR),OnBoard(FA/MA+),Add-on (SB2);",
+	"OTU,Stereo Mix,None,25%,50%,100%;",
 	"OQR,RAM,Fx (SR/FR/FH/FA),Mx (MR/MH/MA/MC),512KB;",
 	"-;",
 	"R6,Reset;",
@@ -561,7 +562,7 @@ wire HSync, VSync, ce_pix, vid_de;
 
 // The tape reaches the 8251 as an asynchronous serial line, either from an image in the
 // Tape slot or from the ADC, where only the tone is decoded.
-localparam CLK_SYS_HZ = 20238095;
+localparam CLK_SYS_HZ = 18973214;
 
 wire       cmt_mton;
 wire [1:0] cmt_bs;

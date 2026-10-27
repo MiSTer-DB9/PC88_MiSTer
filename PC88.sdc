@@ -35,11 +35,11 @@ foreach inst {
 	set_multicycle_path -hold  3 -from $regs -to $regs
 }
 
-# Crossings between rclk (75.892857 MHz, general[0]) and clk21m (20.238095 MHz,
-# general[1]).
+# Crossings between rclk (75.892857 MHz, general[0]) and clk21m (18.973214 MHz,
+# general[1], exactly a quarter of rclk).
 # Both come from the core PLL, so TimeQuest checks every crossing against the
-# closest pair of edges (about 3.29 ns), even where the RTL already makes the
-# crossing safe. Only those are listed here, by name:
+# closest pair of edges, one rclk period (13.176 ns), even where the RTL already
+# makes the crossing safe. Only those are listed here, by name:
 #  - the first stage of each cdc_sync2, which takes a single bit and is seen
 #    one clock later at worst,
 #  - values that cdc_busport, cdc_hs and sdrbridge hold until a synchronized
@@ -96,7 +96,7 @@ set_max_delay -from $pc88_clk21 -to $regs 13.176
 # sound chips and the 8251, so it is not named.
 foreach p [list "$pc88_top|mainport:MP|cdc_busport:port0" "$pc88_sub|fdcport:FDP|cdc_busport:port0"] {
 	set held [pc88_cdc_regs "$p held" [list "$p|hrd" "$p|hadrb\[*\]" "$p|hwd\[*\]"]]
-	set_max_delay -from $held -to $pc88_clk21 49.411
+	set_max_delay -from $held -to $pc88_clk21 52.706
 	set_max_delay -from [pc88_cdc_regs "$p rhold" [list "$p|rhold\[*\]"]] \
 	              -to   [pc88_cdc_regs "$p rdatb" [list "$p|rdatb\[*\]"]] 26.353
 }
@@ -117,7 +117,7 @@ foreach {b c} {FDEB FDE FECB FEC SNDB SND} {
 	set_max_delay -from [pc88_cdc_regs "$b held" [list "$pc88_top|sdrbridge:$b|ADRb\[*\]" "$pc88_top|sdrbridge:$b|WDATb\[*\]" "$pc88_top|sdrbridge:$b|WRb"]] \
 	              -to   [pc88_cdc_regs "$c take" [list "$pc88_ram|${c}ADRb\[*\]" "$pc88_ram|${c}WDATb\[*\]" "$pc88_ram|${c}JOB\[*\]"]] 26.353
 	set_max_delay -from [pc88_cdc_regs "$c read"  [list "$pc88_ram|${c}RDAT\[*\]"]] \
-	              -to   [pc88_cdc_regs "$b RDATb" [list "$pc88_top|sdrbridge:$b|RDATb\[*\]"]] 49.411
+	              -to   [pc88_cdc_regs "$b RDATb" [list "$pc88_top|sdrbridge:$b|RDATb\[*\]"]] 52.706
 }
 
 # ROM loader (the first download after the core is loaded, boot.rom; ldr_done
@@ -149,8 +149,8 @@ foreach {s d} [list \
 
 # MiSTer framework: hps_io and sys_top run on clk_sys, which is clk21m here,
 # and the video side on CLK_VIDEO, which is rclk. Both come from the core PLL
-# (15:4), so the values that cross between them are checked against the
-# closest pair of edges, about 3.29 ns. The settings below change only when the OSD
+# (4:1), so the values that cross between them are checked against the
+# closest pair of edges, one rclk period (13.176 ns). The settings below change only when the OSD
 # or the HPS writes them; the VS inputs and the video measurements go the other
 # way and change with the video. Each receiver
 #  - computes from it again and again (video_freak, the HDMI window in sys_top,
@@ -162,9 +162,18 @@ foreach {s d} [list \
 #  - is read by the HPS after vid_nres has changed, which happens once the
 #    width and height (vid_hcnt, vid_vcnt in hps_io's video_calc) have
 #    stayed the same for about 15 frames (a forced read that meets a change of
-#    resolution is read again when vid_nres changes). vid_ccnt, vid_pixrep,
-#    vid_de_h and vid_de_v can change between lines or frames at the same
-#    resolution, so they are not covered here.
+#    resolution is read again when vid_nres changes). vid_fclks counts
+#    CLK_VIDEO only in the first frame after such a change and then holds,
+#    about 14 frames before vid_nres changes. This does not make every read
+#    of it safe: a forced read in that frame or a change that comes before
+#    the HPS has read both of its halves can give an unfinished count or bits
+#    from different times, and frames without a picture or vsync while it
+#    counts keep it running, so that it can stop on several frames' worth of
+#    clocks, a count that stays until the next change of resolution. The HPS
+#    uses it for the color subcarrier of the YC output (S-Video, composite or
+#    RGB with subcarrier, also on HDMI with Direct Video).
+#    vid_ccnt, vid_pixrep, vid_de_h and vid_de_v can change between lines
+#    or frames at the same resolution, so they are not covered here.
 # A value that misses a clock is taken at the receiver's next sample: a clock,
 # a line or a frame later (osd_en, on alternate frames). One rclk clock is
 # used.
@@ -180,7 +189,7 @@ foreach {s d} [list \
 	"$pc88_hps|gamma_en" "emu:emu|gamma_fast:gamma|RGB_out\[*\]" \
 	"$pc88_hps|status\[28\]" "emu:emu|color_real_s1" \
 	"emu:emu|en400p" "$pc88_hps|io_dout\[*\]" \
-	"$pc88_vc|vid_hcnt\[*\] $pc88_vc|vid_vcnt\[*\] $pc88_vc|vid_nres\[*\]" \
+	"$pc88_vc|vid_hcnt\[*\] $pc88_vc|vid_vcnt\[*\] $pc88_vc|vid_nres\[*\] $pc88_vc|vid_fclks\[*\]" \
 		"$pc88_vc|dout\[*\]" \
 	"osd:vga_osd|info osd:vga_osd|infoh\[*\] osd:vga_osd|osd_h\[*\] osd:vga_osd|osd_w\[*\]" \
 		"osd:vga_osd|osd_hcnt2\[*\] osd:vga_osd|osd_de\[*\]" \

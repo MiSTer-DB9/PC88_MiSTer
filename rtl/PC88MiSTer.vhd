@@ -6,7 +6,8 @@ LIBRARY	IEEE,work;
 	
 entity PC88MiSTer is
 generic(
-	SYSCLK		:integer	:=20238;		--kHz
+	SYSCLK		:integer	:=18973;		--kHz
+	SYSCLK_HZ	:integer	:=18973214;	--Hz, for the counts that add up over time (RTC, 600Hz)
 	VIDCLK		:integer	:=75892;		--kHz
 	RAMCLK		:integer	:=75892;		--kHz
 	USE_OPN		:integer	:=5;
@@ -747,7 +748,25 @@ port(
 	ce_f	:in std_logic;
 	rstn	:in std_logic;
 
-	VRTC	:in std_logic
+	VRTC	:in std_logic;
+	QWAIT	:in std_logic
+);
+end component;
+
+component GVWQ
+port(
+	SEL		:in std_logic;
+	WRn		:in std_logic;
+	en		:in std_logic;
+
+	QWAIT	:out std_logic;
+
+	HRTC	:in std_logic;
+	VRTC	:in std_logic;
+
+	clk		:in std_logic;
+	ce_f	:in std_logic;
+	rstn	:in std_logic
 );
 end component;
 
@@ -1315,6 +1334,7 @@ port(
 	mondat	:out std_logic_vector(7 downto 0);
 	
 	EMUINITDONE		:out std_logic;
+	EMULOADING		:out std_logic;
 	EMUBUSY			:out std_logic;
 	FDCBUSY			:out std_logic;
 	CPUCLK			:in std_logic;
@@ -1629,6 +1649,7 @@ signal	INT_n		:std_logic;
 signal	NMI_n		:std_logic;
 signal	M1_n		:std_logic;
 signal	CPU_rstn	:std_logic;
+signal	CPU_relcnt	:integer range 0 to SYSCLK*100;
 signal	CPU_clk		:std_logic;
 signal	BUSRQ_n		:std_logic;
 signal	BUSRQ_nf	:std_logic;
@@ -1747,6 +1768,8 @@ signal	GVEN		:std_logic;
 signal	GVRET		:std_logic;
 signal	GV_other	:std_logic;
 signal	GV_M1W		:std_logic;
+signal	GVQEN		:std_logic;
+signal	GVQWAIT		:std_logic;
 signal	MEM_WAITn	:std_logic;
 signal	MEMSEL		:std_logic;
 signal	MEMEN		:std_logic;
@@ -2041,6 +2064,7 @@ signal	RAM_WAITr	:std_logic;
 
 --DISK emulation
 signal	EMUINITDONE	:std_logic;
+signal	EMULOADING	:std_logic;
 -- signal	KBRX		:std_logic;
 
 signal	FDE_ADDR	:std_logic_vector(22 downto 0);
@@ -2702,6 +2726,8 @@ port map(
 	-- They are released only when a transfer of the OSD settings has just been taken
 	-- on rclk with the video timing set now, so VTm takes that timing before the
 	-- release. cfg_vt is the timing CFGX takes when it starts a transfer.
+	-- They wait 100ms with no disk image loading first, so an image mounted at
+	-- start-up is in the drive before the boot reads it.
 	process(clk21m)begin
 		if(clk21m' event and clk21m='1')then
 			if(cfg_busy='0')then
@@ -2712,9 +2738,16 @@ port map(
 	process(clk21m,rstn,srstna)begin
 		if(rstn='0' or srstna='0')then
 			CPU_rstn<='0';
+			CPU_relcnt<=0;
 		elsif(clk21m' event and clk21m='1')then
-			if(LOADER_DONE='1' and EMUINITDONE='1' and RTC_RELOK='1' and cfg_done='1' and cfg_vt=cfg_a(10 downto 9))then
-				CPU_rstn<='1';
+			if(LOADER_DONE='1' and EMUINITDONE='1' and RTC_RELOK='1' and EMULOADING='0')then
+				if(CPU_relcnt/=SYSCLK*100)then
+					CPU_relcnt<=CPU_relcnt+1;
+				elsif(cfg_done='1' and cfg_vt=cfg_a(10 downto 9))then
+					CPU_rstn<='1';
+				end if;
+			else
+				CPU_relcnt<=0;
 			end if;
 		end if;
 	end process;
@@ -3121,7 +3154,11 @@ port map(
 	-- With the graphic screen off, a real FH gives graphic VRAM accesses the
 	-- retrace wait also while the screen is drawn.
 	GVRET<=VRTCr or not GRAPHEN;
-	GVW		:GVWAIT port map(GVSEL,GV_M1W,CPUMD,GVEN,GV_WAITn,rclk,cpuce_f,CPU_rstnr,GVRET);
+	-- At 8MHz in 24kHz timing, V1H and V2 hold writes back while the screen
+	-- is drawn, as measured on a real FH (GVWQ).
+	GVQEN<='1' when T24='1' and cHS='1' and CPUMD='1' and GRAPHEN='1' else '0';
+	GVWQ0	:GVWQ port map(GVSEL,WR_n,GVQEN,GVQWAIT,HRTCr,VRTCr,rclk,cpuce_f,CPU_rstnr);
+	GVW		:GVWAIT port map(GVSEL,GV_M1W,CPUMD,GVEN,GV_WAITn,rclk,cpuce_f,CPU_rstnr,GVRET,GVQWAIT);
 	-- V1S and N slow down the whole CPU while graphic VRAM is selected for
 	-- direct access (5Ch-5Eh) and the graphic screen is being displayed,
 	-- as measured on a real FH. Every user of cpuce_r/cpuce_f gets the
@@ -3290,7 +3327,7 @@ port map(
 	-- The RTC finds the edges of STB and CCK on clk21m: bring both in first.
 	RTCSTBs	:cdc_sync2 port map(CSTB,CSTB21,clk21m);
 	RTCCKs	:cdc_sync2 port map(CCK,CCK21,clk21m);
-	U_RTC	:rtc4990MiSTer generic map(sysclk*1000,x"00") port map(
+	U_RTC	:rtc4990MiSTer generic map(SYSCLK_HZ,x"00") port map(
 		DCLK	=>CCK21,
 		DIN		=>C_DO,
 		DOUT	=>CDIo,
@@ -3315,7 +3352,7 @@ port map(
 
 	PCLKG	:unchchata port map(not pjoya(1),pclk,rclk,srstn,cpuce_r);
 	
-	TIMP600	:sftclk generic map(sysclk*1000,600,1) port map("0",RTI,clk21m,srstn21);
+	TIMP600	:sftclk generic map(SYSCLK_HZ,600,1) port map("0",RTI,clk21m,srstn21);
 	
 	-- The fill writes the sub CPU RAM through the same port while the sub CPU is in
 	-- reset (CPU_rstn waits for the fill).
@@ -3390,6 +3427,7 @@ port map(
 		mondat	=>subdat,
 
 		EMUINITDONE		=>EMUINITDONE,
+		EMULOADING		=>EMULOADING,
 		EMUBUSY			=>open,
 		FDCBUSY			=>pLed,
 		CPUCLK			=>SUBCLK,
@@ -3634,8 +3672,8 @@ end process;
 		PSG_OE	<= '0';
 		IDAT_PSG<= (others=>'1');
 
-		-- 7.9872MHz from clk21m = 425/21 MHz (20.238095MHz): 414/1049 is 0.16 ppm slow
-		FMDDS: DDS_OPN generic map(414,1049) port map (
+		-- 7.9872MHz from clk21m = 2125/112 MHz (18.973214MHz): 1654/3929 is 0.39 ppm slow
+		FMDDS: DDS_OPN generic map(1654,3929) port map (
 			rst		=>not srstna,
 			clk		=>clk21m,
 			enable	=>cen_opna
