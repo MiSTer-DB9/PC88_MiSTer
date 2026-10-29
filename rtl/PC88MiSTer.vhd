@@ -1200,6 +1200,7 @@ port(
 	FM_WDAT	:out std_logic_vector(7 downto 0);
 	FM_CEN	:in std_logic	:='0';
 	FM1_WRn	:out std_logic;
+	FM1_RDn	:out std_logic;
 	FM1_ADR	:out std_logic;
 	FM1_RDAT:in std_logic_vector(7 downto 0)	:=(others=>'1');
 	FM2_CSn	:out std_logic;
@@ -1425,6 +1426,10 @@ port(
 end component;
 
 component JT03 
+	generic(
+		rd_hold		:integer	:=0;
+		rd_refresh	:integer	:=0
+	);
 	port(
 		rst		:in std_logic;
 		clk		:in std_logic;
@@ -1433,6 +1438,7 @@ component JT03
 		addr	:in std_logic;
 		cs_n	:in std_logic;
 		wr_n	:in std_logic;
+		rd_n	:in std_logic	:='1';
 		
 		dout	:out std_logic_vector(7 downto 0);
 		irq_n	:out std_logic;
@@ -1458,6 +1464,10 @@ component JT03
 end component;
 
 component JTOPNA
+	generic(
+		rd_hold		:integer	:=0;
+		rd_refresh	:integer	:=0
+	);
 	port(
 		rst		:in std_logic;
 		clk		:in std_logic;
@@ -1827,6 +1837,7 @@ signal	VRTCi		:std_logic;
 signal	PPIFD_CSn	:std_logic;
 signal	PSG_CEn		:std_logic;
 signal	SB1_WRn		:std_logic;
+signal	SB1_RDn		:std_logic;
 signal	SB2_CEn		:std_logic;
 
 signal	TCNV_TDAT	:std_logic_vector(7 downto 0);
@@ -1946,6 +1957,11 @@ signal	SUB_HTM2S	:std_logic_vector(3 downto 0);
 signal	SUB_HTS2M	:std_logic_vector(3 downto 0);
 signal	SUB_HRM2S	:std_logic_vector(3 downto 0);
 signal	SUB_HRS2M	:std_logic_vector(3 downto 0);
+signal	SUB_S2Mdl	:std_logic_vector(24*8-1 downto 0);
+signal	SUB_TXS2Md	:std_logic_vector(7 downto 0);
+signal	SUB_RXS2Md	:std_logic_vector(7 downto 0);
+signal	SUB_HTS2Md	:std_logic_vector(3 downto 0);
+signal	SUB_HRS2Md	:std_logic_vector(3 downto 0);
 
 signal	IORQ_np		:std_logic;
 signal	MREQ_np		:std_logic;
@@ -3047,6 +3063,19 @@ port map(
 	
 	LOWRES<=L200 or GCOLOR;
 	
+	-- The main CPU sees the lines from the sub CPU's 8255 eight rclk cycles
+	-- (about 105 ns) late. At 8MHz this matches the handshake timing measured
+	-- on a FH (5 to 12 cycles do); at 4MHz the timing does not change.
+	process(rclk)begin
+		if(rclk' event and rclk='1')then
+			SUB_S2Mdl<=SUB_S2Mdl(24*7-1 downto 0) & SUB_RXS2M & SUB_TXS2M & SUB_HTS2M & SUB_HRS2M;
+		end if;
+	end process;
+	SUB_RXS2Md<=SUB_S2Mdl(24*8-1 downto 24*8-8);
+	SUB_TXS2Md<=SUB_S2Mdl(24*8-9 downto 24*8-16);
+	SUB_HTS2Md<=SUB_S2Mdl(24*8-17 downto 24*8-20);
+	SUB_HRS2Md<=SUB_S2Mdl(24*8-21 downto 24*8-24);
+
 	PPIFD_CSn<='0' when IORQ_n='0' and CPUADR(7 downto 2)="111111" else '1';
 	PPIFD	:e8255 port map(
 		CSn		=>PPIFD_CSn,
@@ -3057,16 +3086,16 @@ port map(
 		DATOUT	=>IDAT_PPIFD,
 		DATOE	=>PPIFD_OE,
 		
-		PAi		=>SUB_RXS2M,
+		PAi		=>SUB_RXS2Md,
 		PAo		=>SUB_RXM2S,
 		PAoe		=>open,
-		PBi		=>SUB_TXS2M,
+		PBi		=>SUB_TXS2Md,
 		PBo		=>SUB_TXM2S,
 		PBoe		=>open,
-		PCHi		=>SUB_HTS2M,
+		PCHi		=>SUB_HTS2Md,
 		PCHo		=>SUB_HTM2S,
 		PCHoe		=>open,
-		PCLi		=>SUB_HRS2M,
+		PCLi		=>SUB_HRS2Md,
 		PCLo		=>SUB_HRM2S,
 		PCLoe		=>open,
 		
@@ -3691,14 +3720,16 @@ end process;
 		end process;
 		cen_opn <= cen_opna and cen_4m;
 
-		FMSB1: JT03 port map (
+		-- 44h status remnant: 125 ms (2371652 clk21m), restarted by a 44h read within 10 ms (189732)
+		FMSB1: JT03 generic map (rd_hold=>2371652, rd_refresh=>189732) port map (
 			rst		=>not CPU_rstn,
 			clk		=>clk21m,
 			cen		=>cen_opn,
 			din		=>FM_WDAT,
 			addr	=>SB1_ADR,
-			cs_n	=>SB1_WRn,
+			cs_n	=>SB1_WRn and SB1_RDn,
 			wr_n	=>SB1_WRn,
+			rd_n	=>SB1_RDn,
 
 			dout	=>IDAT_SB1,
 			irq_n	=>INTn_SB1,
@@ -3723,7 +3754,8 @@ end process;
 		sndPSG(15)<='0';
 		sndPSG(2 downto 0)<="000";
 
-		FMSB2: JTOPNA port map (
+		-- 44h status remnant: 110 ms (2087054 clk21m)
+		FMSB2: JTOPNA generic map (rd_hold=>2087054, rd_refresh=>0) port map (
 			rst		=>not CPU_rstn,
 			clk		=>clk21m, 
 			cen		=>cen_opna,
@@ -3809,6 +3841,7 @@ end process;
 		FM_WDAT	=>FM_WDAT,
 		FM_CEN	=>cen_opna,
 		FM1_WRn	=>SB1_WRn,
+		FM1_RDn	=>SB1_RDn,
 		FM1_ADR	=>SB1_ADR,
 		FM1_RDAT=>IDAT_SB1,
 		FM2_CSn	=>SB2_CEn,
