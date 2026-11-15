@@ -530,8 +530,10 @@ wire [1:0]FDsync=status[16:15];
 wire	cInDev	=status[20];
 wire	cKbUS	=status[23];
 wire	cSnacKb	=status[33:32]==2'd1;
-// USER_IO[0] is let go, so that a keyboard on the SNAC is not held low while SNAC is Off
-assign USER_OUT = {6'b0, 1'b1};
+// [MiSTer-DB9 BEGIN] - upstream's "assign USER_OUT = {6'b0, 1'b1};" removed: USER_OUT is owned by
+// the DB9 driver (assign USER_OUT = USER_OUT_DRIVE; above), whose idle value 8'hFF releases USER_IO[0]
+// exactly as upstream intends, so a SNAC keyboard is not held low while SNAC is Off.
+// [MiSTer-DB9 END]
 wire [1:0]cSB	=status[22:21];
 wire [1:0]cVtiming=status[25:24];
 
